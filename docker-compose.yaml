@@ -1,0 +1,57 @@
+# 🌺 Camélia PoC #2 — Tool Calling com Sandbox
+# 4 containers: nats, model-deepseek, tool-executor, agent
+
+services:
+  nats:
+    image: nats:latest
+    command: --jetstream
+    networks: [camelia]
+    healthcheck:
+      test: ["CMD", "nats-server", "--version"]
+      interval: 5s
+      retries: 5
+
+  model-deepseek:
+    build:
+      context: .
+      dockerfile: containers/model-deepseek/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      - NATS_URL=nats://nats:4222
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - SERVICE_NAME=model-deepseek
+
+  tool-executor:
+    build:
+      context: .
+      dockerfile: containers/tool-executor/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      - NATS_URL=nats://nats:4222
+      - SANDBOX_DIR=/tmp/sandbox
+
+  agent:
+    build:
+      context: .
+      dockerfile: containers/agent/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+      model-deepseek:
+        condition: service_started
+      tool-executor:
+        condition: service_started
+    environment:
+      - NATS_URL=nats://nats:4222
+      - SERVICE_NAME=agent
+
+networks:
+  camelia:
+    driver: bridge

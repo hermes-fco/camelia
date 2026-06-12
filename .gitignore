@@ -1,0 +1,30 @@
+# 🌺 Camélia
+
+# Secrets — NUNCA commitar
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+
+# Raku
+.precomp/
+lib/.precomp/
+
+# Docker
+.camelia-data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+/tmp/
