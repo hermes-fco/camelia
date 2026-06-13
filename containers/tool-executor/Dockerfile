@@ -1,9 +1,5 @@
-FROM python:3.13-slim
+FROM camelia-base:latest
 
-RUN pip install nats-py
+COPY containers/tool-executor/service.raku /app/service.raku
 
-COPY containers/tool-executor/service.py /app/service.py
-WORKDIR /app
-
-ENV PYTHONUNBUFFERED=1
-ENTRYPOINT ["python", "/app/service.py"]
+ENTRYPOINT ["raku", "/app/service.raku"]

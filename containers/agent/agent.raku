@@ -1,5 +1,5 @@
 #!/usr/bin/env raku
-# 🌺 Camélia PoC #2 — Agent with Tool Calling
+# 🌺 Camelia PoC #2 - Agent with Tool Calling
 
 use Nats;
 use JSON::Fast;
@@ -62,11 +62,11 @@ my $system = q:to/END/;
 Voce e um assistente de terminal Linux conciso. Pode executar comandos shell,
 ler e escrever arquivos no sandbox (/tmp/sandbox).
 Sempre responda em portugues brasileiro.
-Seja direto e pratico — va direto ao ponto.
+Seja direto e pratico - va direto ao ponto.
 END
 
 # ── User prompt ──
-my $user-prompt = %*ENV<PROMPT> // 'Liste os arquivos do diretório atual, depois crie um arquivo chamado "ola.txt" com o texto "Olá Camélia!" e mostre o conteúdo dele.';
+my $user-prompt = %*ENV<PROMPT> // 'Liste os arquivos do diretorio atual, depois crie um arquivo chamado "ola.txt" com o texto "Ola Camelia!" e mostre o conteudo dele.';
 
 note "🟡 Conectando NATS ($nats-url)...";
 my $nats = Nats.new: :servers[$nats-url];
@@ -95,22 +95,28 @@ loop {
         :@tools,
         :tool_choice<auto>,
     };
+    note "DEBUG payload: chars={$request.chars} bytes={$request.encode('utf8').bytes}";
 
     note "📤 Turno {5 - $max-turns}: enviando para o model (id=$request-id)...";
 
     # Inbox pra resposta do model
     my $model-inbox = "_INBOX.model." ~ (('a'..'z').pick xx 12).join;
-    my $model-sub   = $nats.subscribe: $model-inbox, :max-messages(1);
-    my $model-reply = $model-sub.supply.head.Promise;
+    my $model-sub   = $nats.subscribe: $model-inbox;
+    # Tap BEFORE publish — avoids race where reply arrives before listener
+    my $model-reply = start await $model-sub.supply.head.Promise;
 
     $nats.publish: 'model.deepseek.completion', $request, :reply-to($model-inbox);
 
+    note "DEBUG aguardando resposta no inbox $model-inbox...";
     my $model-msg = await $model-reply;
+    $nats.unsubscribe: $model-sub;
+    note "DEBUG resposta recebida! Defined={$model-msg.defined}, Payload={$model-msg.?payload.?chars // 'NONE'}";
     unless $model-msg && $model-msg.payload {
         note "❌ Sem resposta do model";
         last;
     }
 
+    note "DEBUG agent payload: {$model-msg.payload.chars} chars, first 300: {$model-msg.payload.substr(0, 300)}";
     my %response = try from-json($model-msg.payload);
     if $! {
         note "❌ JSON inválido do model: $!";
@@ -130,7 +136,7 @@ loop {
     my $message = $choice<message> // {};
     my $finish  = $choice<finish_reason> // '';
 
-    # Se tem conteúdo textual, mostra
+    # Se tem conteudo textual, mostra
     if $message<content> {
         say "🤖 {$message<content>}";
     }
@@ -155,7 +161,7 @@ loop {
 
             # Publica no tool-executor com inbox
             my $tool-inbox = "_INBOX.tool." ~ (('a'..'z').pick xx 12).join;
-            my $tool-sub   = $nats.subscribe: $tool-inbox, :max-messages(1);
+            my $tool-sub   = $nats.subscribe: $tool-inbox;
             my $tool-reply = $tool-sub.supply.head.Promise;
 
             $nats.publish: "tools.exec.{$name}", to-json({
@@ -165,6 +171,7 @@ loop {
             }), :reply-to($tool-inbox);
 
             my $tool-msg = await $tool-reply;
+            $nats.unsubscribe: $tool-sub;
             if $tool-msg && $tool-msg.payload {
                 my %result = try from-json($tool-msg.payload);
                 @results.push: %result;
@@ -184,12 +191,12 @@ loop {
             };
         }
 
-        # Continua o loop — reenvia pro model com resultados
+        # Continua o loop - reenvia pro model com resultados
         note "🔄 Reenviando para o model com resultados...";
         next;
     }
 
-    # finish_reason 'stop' — terminou
+    # finish_reason 'stop' - terminou
     if $finish eq 'stop' {
         # Adiciona a mensagem final ao histórico
         @messages.push: $message;
@@ -198,7 +205,7 @@ loop {
     }
 
     # Outros finish_reason (length, content_filter, etc)
-    note "⚠️ finish_reason={$finish} — encerrando.";
+    note "⚠️ finish_reason={$finish} - encerrando.";
     last;
 }
 

@@ -26,8 +26,8 @@
 | Container | Linguagem | Responsabilidade | Tem acesso a |
 |-----------|-----------|------------------|--------------|
 | **agent** | Raku | Orquestra conversa, roteia tool calls | NATS only |
-| **model-deepseek** | Python | Chama API DeepSeek, decide tools | API key + NATS |
-| **tool-executor** | Python | Executa shell, lê/escreve arquivos | Sandbox + NATS |
+| **model-deepseek** | Raku | Chama API DeepSeek, decide tools | API key + NATS |
+| **tool-executor** | Raku | Executa shell, lê/escreve arquivos | Sandbox + NATS |
 | **nats** | Go | Message broker | Rede interna |
 
 ### Isolamento
@@ -53,12 +53,12 @@ camelia/
 │   ├── agent/           # Raku — orquestrador
 │   │   ├── Dockerfile
 │   │   └── agent.raku
-│   ├── model-deepseek/  # Python — provider LLM
+│   ├── model-deepseek/  # Raku — provider LLM
 │   │   ├── Dockerfile
-│   │   └── service.py
-│   ├── tool-executor/   # Python — sandbox de execução
+│   │   └── service.raku
+│   ├── tool-executor/   # Raku — sandbox de execução
 │   │   ├── Dockerfile
-│   │   └── service.py
+│   │   └── service.raku
 │   └── base/            # Raku base image (legacy)
 │       └── Dockerfile
 ├── lib/

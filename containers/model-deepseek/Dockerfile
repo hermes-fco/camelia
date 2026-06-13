@@ -1,11 +1,8 @@
-FROM python:3.13-slim
+FROM camelia-base:latest
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-RUN pip install nats-py
 
-COPY containers/model-deepseek/service.py /app/service.py
-WORKDIR /app
+COPY containers/model-deepseek/service.raku /app/service.raku
 
-ENV PYTHONUNBUFFERED=1
-ENTRYPOINT ["python", "/app/service.py"]
+ENTRYPOINT ["raku", "/app/service.raku"]
