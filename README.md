@@ -1,43 +1,48 @@
 # 🌺 Camélia
 
 **Multi-agent AI framework** em Raku com isolamento de credenciais via NATS.
+**Toda comunicação entre componentes é feita exclusivamente via NATS.**
 
 ## Arquitetura (PoC #3 — Multi-Agent Delegation)
 
 ```
-                        ┌─────────────────┐
-                        │  ORCHESTRATOR   │
-                        │  (decompõe +    │
-                        │   sintetiza)    │
-                        └───┬─────────┬───┘
-                            │         │
-               worker.*.task│         │worker.*.task
-                            ▼         ▼
-                 ┌────────────┐  ┌────────────┐
-                 │  WORKER A  │  │  WORKER B  │
-                 │ (code-     │  │ (doc-      │
-                 │  reader)   │  │  writer)   │
-                 └──┬─────┬───┘  └──┬─────┬───┘
-                    │     │         │     │
-       model.deepseek│     │tools.   │     │
-           .completion│     │exec.*   │     │
-                    ▼     ▼         ▼     ▼
-              ┌──────────┐     ┌──────────────┐
-              │  MODEL   │     │    TOOL      │
-              │ DEEPSEEK │     │  EXECUTOR    │
-              │ (API key)│     │  (sandbox)   │
-              └──────────┘     └──────────────┘
-                     │              │
-                     └──── NATS ────┘
+   user / CLI
+       │
+       │ nats pub orchestrator.task '{"prompt":"..."}' --reply inbox
+       ▼
+┌─────────────────┐
+│  ORCHESTRATOR   │  subscribe: orchestrator.task
+│  (decompõe +    │
+│   sintetiza)    │
+└───┬─────────┬───┘
+    │         │
+    │         │ worker.*.task (paralelo)
+    ▼         ▼
+┌────────────┐  ┌────────────┐
+│  WORKER A  │  │  WORKER B  │  subscribe: worker.<id>.task
+│ (code-     │  │ (doc-      │
+│  reader)   │  │  writer)   │
+└──┬─────┬───┘  └──┬─────┬───┘
+   │     │         │     │
+   │     │         │     │
+   ▼     ▼         ▼     ▼
+┌──────────┐     ┌──────────────┐
+│  MODEL   │     │    TOOL      │
+│ DEEPSEEK │     │  EXECUTOR    │
+│ (API key)│     │  (sandbox)   │
+└──────────┘     └──────────────┘
+      │                │
+      └────── NATS ────┘
 ```
 
 ### Fluxo
 
-1. **Orchestrator** recebe prompt do usuário
-2. Chama o model pra **decompor** em 2-3 subtasks paralelas
-3. **Spawna workers** publicando `worker.<id>.task` via NATS
-4. Cada **worker** processa sua task (model + tools) e retorna resultado
-5. Orquestrador coleta todos e chama o model pra **sintetizar** resposta final
+1. Usuário publica `orchestrator.task` com `{"prompt": "..."}` via NATS
+2. **Orchestrator** recebe, chama model pra **decompor** em 2-3 subtasks paralelas
+3. **Spawna workers** publicando `worker.<id>.task` (paralelo, cada um com inbox)
+4. Cada **worker** processa sua task (model loop + tools) e responde ao inbox
+5. Orquestrador coleta todos, chama model pra **sintetizar** resposta final
+6. Resultado enviado ao **inbox reply-to** do caller
 
 ### Containers
 
@@ -103,23 +108,25 @@ camelia/
 cp .env.example .env
 # Edite .env com sua DEEPSEEK_API_KEY
 
-# 2. Suba o stack
+# 2. Suba o stack (tudo long-running, aguardando mensagens NATS)
 docker compose up -d
 
-# 3. Rode o orchestrator
-docker compose run --rm orchestrator
+# 3. Envie um prompt via NATS CLI
+nats pub orchestrator.task '{"prompt":"Analise /root/camelia: descreva containers/ e lib/"}' --reply inbox
 
-# Ou customize o prompt:
-docker compose run --rm -e PROMPT="Analise /root/camelia descrevendo containers/ e lib/ em paralelo" orchestrator
+# Ou com um subscriber esperando a resposta:
+nats sub inbox     # em outro terminal, antes de publicar
+nats pub orchestrator.task '{"prompt":"..."}' --reply inbox
 ```
 
 ## Subjects NATS
 
 | Subject | Direção | Descrição |
 |---------|---------|-----------|
+| `orchestrator.task` | caller → orchestrator | Prompt do usuário (com reply-to inbox) |
+| `worker.{id}.task` | orchestrator → worker | Subtask delegada (com reply-to inbox) |
 | `model.deepseek.completion` | worker/orch → model | Prompt + histórico + tools |
 | `tools.exec.{name}` | worker → executor | Tool call |
-| `worker.{id}.task` | orchestrator → worker | Subtask delegada |
 | `_INBOX.*` | todos → todos | Respostas via inbox dinâmico |
 
 ## Licença
