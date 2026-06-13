@@ -1,5 +1,6 @@
-# 🌺 Camélia PoC #2 — Tool Calling com Sandbox
-# 4 containers: nats, model-deepseek, tool-executor, agent
+# 🌺 Camélia PoC #3 — Multi-Agent Delegation
+# 6 containers: nats, model-deepseek, tool-executor,
+#               worker-code-reader, worker-doc-writer, orchestrator
 
 services:
   nats:
@@ -36,10 +37,10 @@ services:
       - NATS_URL=nats://nats:4222
       - SANDBOX_DIR=/tmp/sandbox
 
-  agent:
+  worker-code-reader:
     build:
       context: .
-      dockerfile: containers/agent/Dockerfile
+      dockerfile: containers/worker/Dockerfile
     networks: [camelia]
     depends_on:
       nats:
@@ -50,7 +51,43 @@ services:
         condition: service_started
     environment:
       - NATS_URL=nats://nats:4222
-      - SERVICE_NAME=agent
+      - WORKER_ID=code-reader
+
+  worker-doc-writer:
+    build:
+      context: .
+      dockerfile: containers/worker/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+      model-deepseek:
+        condition: service_started
+      tool-executor:
+        condition: service_started
+    environment:
+      - NATS_URL=nats://nats:4222
+      - WORKER_ID=doc-writer
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: containers/orchestrator/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+      model-deepseek:
+        condition: service_started
+      tool-executor:
+        condition: service_started
+      worker-code-reader:
+        condition: service_started
+      worker-doc-writer:
+        condition: service_started
+    environment:
+      - NATS_URL=nats://nats:4222
+      - SERVICE_NAME=orchestrator
 
 networks:
   camelia:
