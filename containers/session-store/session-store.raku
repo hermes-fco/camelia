@@ -1,28 +1,19 @@
 #!/usr/bin/env raku
 # 🌺 Camélia PoC #6 — Session Store (persistent session memory)
 #
-# Isolated container that manages session CRUD via NATS.
-# Backend: JetStream stream SESSIONS (one message per session, max 1 per subject).
-# All communication via NATS request-reply.
+# Isolated container for session CRUD via NATS.
+# Backend: JetStream stream SESSIONS (max_msgs_per_subject=1, TTL=7d).
+# CAS (compare-and-swap) via seq number prevents lost updates.
 #
 # Subjects:
-#   session.store.create   → creates new session, returns session_id
-#   session.store.get      → retrieves session by id
-#   session.store.append   → adds entry to session history
-#   session.store.list     → lists all active sessions
-#   session.store.delete   → removes a session
+#   session.store.create   → returns {session_id, session} with seq=0
+#   session.store.get      → returns session with current seq
+#   session.store.append   → CAS: checks expected_seq, appends entries[], returns new seq
+#   session.store.list     → session count
+#   session.store.delete   → purges session
 #
-# Session object stored in JetStream:
-#   {
-#     session_id: "sess-abc123",
-#     created_at: "2026-06-13T...",
-#     task_count: 3,
-#     history: [
-#       {role: "user", content: "..."},
-#       {role: "assistant", content: "..."},
-#       ...
-#     ]
-#   }
+# Session object:
+#   { session_id, created_at, task_count, seq, history: [...] }
 
 use Nats;
 use JSON::Fast;
@@ -102,14 +93,14 @@ sub setup-stream() {
         :name<SESSIONS>,
         :subjects(['session.data.>']),
         :retention<limits>,
-        :max-msgs-per-subject(1),         # only keep latest per session
-        :discard<old>,                     # discard old when new arrives
+        :max-msgs-per-subject(1),
+        :discard<old>,
+        :max-age(604800000000000),  # 7 days TTL in nanoseconds
         ;
 
     my $supply = $stream.create;
     my $resp = await $supply.Promise;
     if $resp && $resp.payload && $resp.payload.contains('"error"') {
-        # Stream may already exist — that's fine
         note "  ⚠️ Stream may already exist: {$resp.payload.substr(0, 100)}";
     }
 
@@ -128,6 +119,7 @@ sub handle-create(Str $reply-to, %req) {
         :session_id($sid),
         :created_at($now),
         :task_count(0),
+        :seq(0),
         :history([]),
     };
 
@@ -163,12 +155,23 @@ sub handle-get(Str $reply-to, %req) {
 }
 
 sub handle-append(Str $reply-to, %req) {
-    my $sid      = %req<session_id> // '';
-    my $role     = %req<role>       // '';
-    my $content  = %req<content>    // '';
+    my $sid          = %req<session_id>   // '';
+    my $expected-seq = %req<expected_seq> // -1;
 
-    unless $sid && $role && $content {
-        $nats.publish: $reply-to, to-json({ :error("Missing session_id, role, or content") });
+    # Accept either single {role, content} or batch entries[]
+    my @entries;
+    if %req<entries>:exists {
+        @entries = %req<entries>.List;
+    } else {
+        my $role    = %req<role>    // '';
+        my $content = %req<content> // '';
+        if $role && $content {
+            @entries = [{ :$role, :$content }];
+        }
+    }
+
+    unless $sid && @entries.elems > 0 {
+        $nats.publish: $reply-to, to-json({ :error("Missing session_id or entries") });
         return;
     }
 
@@ -187,20 +190,44 @@ sub handle-append(Str $reply-to, %req) {
         return;
     }
 
-    # Append entry
-    %session<history>.push: { :$role, :$content };
-    %session<task_count> = (%session<task_count> // 0) + 1;
+    # ═══ CAS: compare-and-swap ═══
+    if $expected-seq >= 0 && (%session<seq> // -1) != $expected-seq {
+        note "  ⚠️ Seq conflict on {$sid}: expected {$expected-seq}, current {%session<seq>}";
+        $nats.publish: $reply-to, to-json({
+            :error("Seq conflict"),
+            :conflict(True),
+            :expected_seq($expected-seq),
+            :current_seq(%session<seq> // -1),
+        });
+        return;
+    }
+
+    # Append entries
+    for @entries -> $entry {
+        %session<history>.push: $entry;
+    }
+    %session<task_count> += @entries.elems;
+    %session<seq> = (%session<seq> // 0) + 1;
+
+    # ── Truncate history: keep last 40 entries (20 turns) ──
+    if %session<history>.elems > 40 {
+        %session<history> = %session<history>[*-40 .. *].Array;
+    }
 
     # Write back
     my $subject = "session.data.{$sid}";
     $nats.publish: $subject, to-json(%session);
 
-    note "  📝 Appended {$role} to session {$sid} (task_count={%session<task_count>})";
-    $nats.publish: $reply-to, to-json({ :ok(True), :session_id($sid), :task_count(%session<task_count>) });
+    note "  📝 Appended {+@entries} entries to {$sid} (seq={%session<seq>}, tasks={%session<task_count>})";
+    $nats.publish: $reply-to, to-json({
+        :ok(True),
+        :session_id($sid),
+        :task_count(%session<task_count>),
+        :seq(%session<seq>),
+    });
 }
 
 sub handle-list(Str $reply-to) {
-    # Use stream info to list subjects
     my $info-supply = $stream.info;
     my $info-resp = await $info-supply.Promise;
 
@@ -212,8 +239,6 @@ sub handle-list(Str $reply-to) {
     my %info = try from-json($info-resp.payload);
     my $num-subjects = %info<state><num_subjects> // 0;
 
-    # Get session IDs — we can get them from stream names or just report count
-    # For simplicity, report count. Full list would need stream subject enumeration.
     note "  📋 Listed sessions: {$num-subjects} active";
     $nats.publish: $reply-to, to-json({
         :ok(True),
@@ -228,7 +253,6 @@ sub handle-delete(Str $reply-to, %req) {
         return;
     }
 
-    # Purge the specific subject using raw JetStream API
     my $purge-subject = "\$JS.API.STREAM.PURGE.SESSIONS";
     my $purge-body = to-json({ :filter("session.data.{$sid}") });
     $nats.request: $purge-subject, $purge-body;

@@ -125,9 +125,11 @@ sub session-load(Str $sid? --> Hash) {
     if $sid {
         my %resp = session-call('get', { :session_id($sid) });
         if %resp<ok> && %resp<session> {
-            note "📂 Loaded session {$sid} ({+%resp<session><history>} history entries)";
+            note "📂 Loaded session {$sid} (seq={%resp<session><seq>}, {+%resp<session><history>} history entries)";
             return %resp<session>;
         }
+        # Session not found or store unreachable — create new
+        note "⚠️ Session {$sid} not found, creating new";
     }
 
     # Create new session
@@ -137,26 +139,23 @@ sub session-load(Str $sid? --> Hash) {
         return %resp<session>;
     }
 
-    # Fallback: create in-memory stub (shouldn't happen if session-store is up)
-    note "⚠️ Session-store unreachable, using ephemeral stub";
-    my $fallback-id = 'sess-' ~ (('a'..'z').pick xx 8).join;
-    return {
-        :session_id($fallback-id),
-        :created_at(DateTime.now.utc.Str),
-        :task_count(0),
-        :history([]),
-    };
+    # Session-store unreachable — fail explicitly (no silent fallback)
+    return { :error("Session-store unreachable") };
 }
 
-sub session-append(Str $sid, Str $role, Str $content) {
+sub session-append-batch(Str $sid, Int $expected-seq, @entries --> Hash) {
     my %resp = session-call('append', {
         :session_id($sid),
-        :$role,
-        :$content,
+        :expected_seq($expected-seq),
+        :@entries,
     });
     if %resp<error> {
         note "⚠️ Session append failed: {%resp<error>}";
+        if %resp<conflict> {
+            note "  🔄 Seq conflict: expected {$expected-seq}, current {%resp<current_seq>}";
+        }
     }
+    return %resp;
 }
 
 # ═════════════════════════════════════════════
@@ -239,7 +238,13 @@ sub spawn-workers(Int $count --> Hash) {
 sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
     # ═══════ SESSION: load from session-store ═══════
     my %session = session-load($session-id);
+    if %session<error> {
+        $nats.publish: $reply-to, to-json({ :error("Session-store unavailable: {%session<error>}") });
+        stream($session-id // 'unknown', 'error', :message("Session-store unavailable"));
+        return;
+    }
     my $sid     = %session<session_id>;
+    my $seq     = %session<seq> // 0;
     my @history = %session<history>.List;
     my $task-n  = (%session<task_count> // 0) + 1;
 
@@ -376,9 +381,11 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
 
     my $final = %s-resp<choices>[0]<message><content> // '';
 
-    # ── Persist session history ──
-    session-append($sid, 'user', $prompt);
-    session-append($sid, 'assistant', $final);
+    # ── Persist session history (atomic batch, CAS) ──
+    session-append-batch($sid, $seq, [
+        { :role<user>,      :content($prompt) },
+        { :role<assistant>, :content($final) },
+    ]);
 
     # ── Send final response ──
     $nats.publish: $reply-to, to-json({
