@@ -9,11 +9,11 @@ $*ERR.out-buffer = False;
 my $model    = %*ENV<DEEPSEEK_MODEL>    // 'deepseek-v4-pro';
 my $nats-url = %*ENV<NATS_URL>          // 'nats://127.0.0.1:4222';
 
-note "🟡 Conectando NATS ($nats-url)...";
+note "🟡 Connecting NATS ($nats-url)...";
 my $nats = Nats.new: :servers[$nats-url];
 await $nats.start;
 $nats.connect;
-note "🟢 NATS conectado.";
+note "🟢 NATS connected.";
 
 my $auth = "Authorization: Bearer " ~ %*ENV<DEEPSEEK_API_KEY>;
 spurt('/tmp/auth_header', $auth);
@@ -30,7 +30,7 @@ react {
         if $! { note "❌ JSON parse: $!"; next; }
         my $request-id = %req<id> // 'unknown';
         my $reply-to   = $msg.?reply-to;
-        note "📨 Prompt recebido (id=$request-id, reply-to={$reply-to // 'NONE'})";
+        note "📨 Prompt received (id=$request-id, reply-to={$reply-to // 'NONE'})";
 
         my %api-body = (
             model    => $model,

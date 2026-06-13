@@ -1,5 +1,5 @@
 #!/usr/bin/env raku
-# 🌺 Camelia PoC #2 - Agent with Tool Calling
+# 🌺 Camelia PoC #2 — Agent with Tool Calling
 
 use Nats;
 use JSON::Fast;
@@ -14,11 +14,11 @@ my @tools = (
         type     => "function",
         function => {
             name        => "run_shell",
-            description => "Executa um comando shell no sandbox Linux e retorna stdout, stderr e exit code.",
+            description => "Execute a shell command in the Linux sandbox and return stdout, stderr and exit code.",
             parameters  => {
                 type       => "object",
                 properties => {
-                    command => { type => "string", description => "Comando shell a executar" },
+                    command => { type => "string", description => "Shell command to execute" },
                 },
                 required => ["command"],
             },
@@ -28,13 +28,13 @@ my @tools = (
         type     => "function",
         function => {
             name        => "read_file",
-            description => "Le um arquivo do sandbox e retorna o conteudo com linhas numeradas.",
+            description => "Read a file from the sandbox and return its content with numbered lines.",
             parameters  => {
                 type       => "object",
                 properties => {
-                    path   => { type => "string", description => "Caminho do arquivo (relativo ao sandbox)" },
-                    offset => { type => "integer", description => "Linha inicial (0-indexed, default 0)" },
-                    limit  => { type => "integer", description => "Maximo de linhas (default 500)" },
+                    path   => { type => "string", description => "File path (relative to sandbox)" },
+                    offset => { type => "integer", description => "Starting line (0-indexed, default 0)" },
+                    limit  => { type => "integer", description => "Max lines (default 500)" },
                 },
                 required => ["path"],
             },
@@ -44,12 +44,12 @@ my @tools = (
         type     => "function",
         function => {
             name        => "write_file",
-            description => "Escreve conteudo em um arquivo no sandbox.",
+            description => "Write content to a file in the sandbox.",
             parameters  => {
                 type       => "object",
                 properties => {
-                    path    => { type => "string", description => "Caminho do arquivo (relativo ao sandbox)" },
-                    content => { type => "string", description => "Conteudo a escrever" },
+                    path    => { type => "string", description => "File path (relative to sandbox)" },
+                    content => { type => "string", description => "Content to write" },
                 },
                 required => ["path", "content"],
             },
@@ -59,35 +59,34 @@ my @tools = (
 
 # ── System prompt ──
 my $system = q:to/END/;
-Voce e um assistente de terminal Linux conciso. Pode executar comandos shell,
-ler e escrever arquivos no sandbox (/tmp/sandbox).
-Sempre responda em portugues brasileiro.
-Seja direto e pratico - va direto ao ponto.
+You are a concise Linux terminal assistant. You can execute shell commands,
+read and write files in the sandbox (/tmp/sandbox).
+Be direct and practical — get straight to the point.
 END
 
 # ── User prompt ──
-my $user-prompt = %*ENV<PROMPT> // 'Liste os arquivos do diretorio atual, depois crie um arquivo chamado "ola.txt" com o texto "Ola Camelia!" e mostre o conteudo dele.';
+my $user-prompt = %*ENV<PROMPT> // 'List files in the current directory, then create a file called "hello.txt" with the text "Hello Camelia!" and show its contents.';
 
-note "🟡 Conectando NATS ($nats-url)...";
+note "🟡 Connecting NATS ($nats-url)...";
 my $nats = Nats.new: :servers[$nats-url];
 await $nats.start;
 $nats.connect;
-note "🟢 NATS conectado.";
+note "🟢 NATS connected.";
 
-# ── Monta histórico inicial ──
+# ── Build initial message history ──
 my @messages = (
     { :role<system>, :content($system) },
     { :role<user>,   :content($user-prompt) },
 );
 
-# ── Loop principal de conversação ──
+# ── Main conversation loop ──
 my $max-turns = 10;
 loop {
     last if $max-turns-- <= 0;
 
     my $request-id = (^2**32).pick.fmt('%08x');
 
-    # Monta request com tools
+    # Build request with tools
     my $request = to-json {
         :id($request-id),
         :model('deepseek-v4-pro'),
@@ -97,9 +96,9 @@ loop {
     };
     note "DEBUG payload: chars={$request.chars} bytes={$request.encode('utf8').bytes}";
 
-    note "📤 Turno {5 - $max-turns}: enviando para o model (id=$request-id)...";
+    note "📤 Turn {5 - $max-turns}: sending to model (id=$request-id)...";
 
-    # Inbox pra resposta do model
+    # Inbox for model response
     my $model-inbox = "_INBOX.model." ~ (('a'..'z').pick xx 12).join;
     my $model-sub   = $nats.subscribe: $model-inbox;
     # Tap BEFORE publish — avoids race where reply arrives before listener
@@ -107,19 +106,19 @@ loop {
 
     $nats.publish: 'model.deepseek.completion', $request, :reply-to($model-inbox);
 
-    note "DEBUG aguardando resposta no inbox $model-inbox...";
+    note "DEBUG waiting for response on inbox $model-inbox...";
     my $model-msg = await $model-reply;
     $nats.unsubscribe: $model-sub;
-    note "DEBUG resposta recebida! Defined={$model-msg.defined}, Payload={$model-msg.?payload.?chars // 'NONE'}";
+    note "DEBUG response received! Defined={$model-msg.defined}, Payload={$model-msg.?payload.?chars // 'NONE'}";
     unless $model-msg && $model-msg.payload {
-        note "❌ Sem resposta do model";
+        note "❌ No response from model";
         last;
     }
 
     note "DEBUG agent payload: {$model-msg.payload.chars} chars, first 300: {$model-msg.payload.substr(0, 300)}";
     my %response = try from-json($model-msg.payload);
     if $! {
-        note "❌ JSON inválido do model: $!";
+        note "❌ Invalid JSON from model: $!";
         last;
     }
 
@@ -136,20 +135,20 @@ loop {
     my $message = $choice<message> // {};
     my $finish  = $choice<finish_reason> // '';
 
-    # Se tem conteudo textual, mostra
+    # If there's text content, show it
     if $message<content> {
         say "🤖 {$message<content>}";
     }
 
-    # Se é tool_call, processa
+    # If it's a tool_call, process it
     if $finish eq 'tool_calls' || $message<tool_calls> {
-        # Adiciona a mensagem do assistant ao histórico
+        # Add assistant message to history
         @messages.push: $message;
 
         my @tool-calls = $message<tool_calls>.List;
-        note "🔧 Model pediu {+@tool-calls} tool call(s)";
+        note "🔧 Model requested {+@tool-calls} tool call(s)";
 
-        # Executa cada tool call em paralelo
+        # Execute each tool call in parallel
         my @results;
         for @tool-calls -> $tc {
             my $fn     = $tc<function>;
@@ -159,7 +158,7 @@ loop {
 
             note "  ⚙️ {$name} (id={$tc-id})";
 
-            # Publica no tool-executor com inbox
+            # Publish to tool-executor with inbox
             my $tool-inbox = "_INBOX.tool." ~ (('a'..'z').pick xx 12).join;
             my $tool-sub   = $nats.subscribe: $tool-inbox;
             my $tool-reply = $tool-sub.supply.head.Promise;
@@ -182,7 +181,7 @@ loop {
             }
         }
 
-        # Adiciona tool results ao histórico
+        # Add tool results to history
         for @tool-calls Z @results -> ($tc, $result) {
             @messages.push: {
                 :role<tool>,
@@ -191,21 +190,21 @@ loop {
             };
         }
 
-        # Continua o loop - reenvia pro model com resultados
-        note "🔄 Reenviando para o model com resultados...";
+        # Continue the loop — resend to model with results
+        note "🔄 Resending to model with results...";
         next;
     }
 
-    # finish_reason 'stop' - terminou
+    # finish_reason 'stop' — done
     if $finish eq 'stop' {
-        # Adiciona a mensagem final ao histórico
+        # Add final message to history
         @messages.push: $message;
-        note "✅ Conversa finalizada.";
+        note "✅ Conversation finished.";
         last;
     }
 
-    # Outros finish_reason (length, content_filter, etc)
-    note "⚠️ finish_reason={$finish} - encerrando.";
+    # Other finish_reason (length, content_filter, etc)
+    note "⚠️ finish_reason={$finish} — ending.";
     last;
 }
 

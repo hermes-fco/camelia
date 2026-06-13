@@ -1,6 +1,6 @@
 #!/usr/bin/env raku
 # 🌺 Camélia — Tool Executor (Raku)
-# Executa comandos shell, lê/escreve arquivos no sandbox
+# Executes shell commands, reads/writes files in the sandbox
 
 use Nats;
 use JSON::Fast;
@@ -12,15 +12,15 @@ my $sandbox-dir = %*ENV<SANDBOX_DIR>  // '/tmp/sandbox';
 
 $sandbox-dir.IO.mkdir: :parents;
 
-note "🟡 Conectando NATS ($nats-url)...";
+note "🟡 Connecting NATS ($nats-url)...";
 my $nats = Nats.new: :servers[$nats-url];
 await $nats.start;
 $nats.connect;
-note "🟢 NATS conectado.";
+note "🟢 NATS connected.";
 
-# Subscribe to tools.exec.> (wildcard NATS)
+# Subscribe to tools.exec.> (NATS wildcard)
 my $sub = $nats.subscribe: 'tools.exec.>';
-note "🟢 Aguardando tool calls em tools.exec.> (sandbox=$sandbox-dir)...";
+note "🟢 Waiting for tool calls on tools.exec.> (sandbox=$sandbox-dir)...";
 
 # ── Tools ──
 
@@ -101,7 +101,7 @@ react {
         my $tool-call-id = %req<tool_call_id> // 'unknown';
         my %args         = %req<arguments> // {};
 
-        note "🔧 Executando {$tool-name} (id={$tool-call-id})";
+        note "🔧 Executing {$tool-name} (id={$tool-call-id})";
 
         my $result;
         if %tools{$tool-name}:exists {

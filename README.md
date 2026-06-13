@@ -1,9 +1,9 @@
 # 🌺 Camélia
 
-**Multi-agent AI framework** em Raku com isolamento de credenciais via NATS.
-**Toda comunicação entre componentes é feita exclusivamente via NATS.**
+**Multi-agent AI framework** in Raku with credential isolation via NATS.
+**All component communication is exclusively via NATS.**
 
-## Arquitetura (PoC #3 — Multi-Agent Delegation)
+## Architecture (PoC #3 — Multi-Agent Delegation)
 
 ```
    user / CLI
@@ -12,11 +12,11 @@
        ▼
 ┌─────────────────┐
 │  ORCHESTRATOR   │  subscribe: orchestrator.task
-│  (decompõe +    │
-│   sintetiza)    │
+│  (decomposes +  │
+│   synthesizes)  │
 └───┬─────────┬───┘
     │         │
-    │         │ worker.*.task (paralelo)
+    │         │ worker.*.task (parallel)
     ▼         ▼
 ┌────────────┐  ┌────────────┐
 │  WORKER A  │  │  WORKER B  │  subscribe: worker.<id>.task
@@ -35,100 +35,100 @@
       └────── NATS ────┘
 ```
 
-### Fluxo
+### Flow
 
-1. Usuário publica `orchestrator.task` com `{"prompt": "..."}` via NATS
-2. **Orchestrator** recebe, chama model pra **decompor** em 2-3 subtasks paralelas
-3. **Spawna workers** publicando `worker.<id>.task` (paralelo, cada um com inbox)
-4. Cada **worker** processa sua task (model loop + tools) e responde ao inbox
-5. Orquestrador coleta todos, chama model pra **sintetizar** resposta final
-6. Resultado enviado ao **inbox reply-to** do caller
+1. User publishes `orchestrator.task` with `{"prompt": "..."}` via NATS
+2. **Orchestrator** receives it, calls model to **decompose** into 2-3 parallel subtasks
+3. **Spawns workers** by publishing `worker.<id>.task` (parallel, each with inbox reply)
+4. Each **worker** processes its task (model loop + tools) and replies via inbox
+5. Orchestrator collects all results, calls model to **synthesize** final response
+6. Result sent to caller's **inbox reply-to**
 
 ### Containers
 
-| Container | Linguagem | Responsabilidade | Tem acesso a |
-|-----------|-----------|------------------|--------------|
-| **orchestrator** | Raku | Decompõe tarefas, spawna workers, sintetiza | NATS only |
-| **worker** | Raku | Agente de longo prazo, processa tasks com tools | NATS only |
-| **model-deepseek** | Raku | Chama API DeepSeek, decide tool calls | API key + NATS |
-| **tool-executor** | Raku | Executa shell, lê/escreve arquivos | Sandbox + NATS |
-| **nats** | Go | Message broker com JetStream | Rede interna |
+| Container | Language | Responsibility | Has access to |
+|-----------|----------|----------------|---------------|
+| **orchestrator** | Raku | Decomposes tasks, spawns workers, synthesizes | NATS only |
+| **worker** | Raku | Long-running agent, processes tasks with tools | NATS only |
+| **model-deepseek** | Raku | Calls DeepSeek API, decides tool calls | API key + NATS |
+| **tool-executor** | Raku | Executes shell, reads/writes files | Sandbox + NATS |
+| **nats** | Go | Message broker with JetStream | Internal network |
 
-### Isolamento
+### Isolation
 
-- API key **nunca sai** do container `model-deepseek`
-- Shell e filesystem **só no** `tool-executor`
-- Orquestrador e workers **não têm** shell nem key — só roteiam mensagens NATS
-- Model **não executa** nada — só decide tool calls
-- Cada worker tem **contexto de conversa isolado**
+- API key **never leaves** the `model-deepseek` container
+- Shell and filesystem **only in** `tool-executor`
+- Orchestrator and workers **have no** shell or key — they only route NATS messages
+- Model **does not execute** anything — it only decides tool calls
+- Each worker has **isolated conversation context**
 
 ## PoCs
 
-| PoC | Descrição | Status |
-|-----|-----------|--------|
-| PoC #1 | Agent ↔ Model via NATS (pub/sub simples) | ✅ |
-| PoC #2 | Multi-turn tool calling com sandbox isolado | ✅ |
-| PoC #3 | Multi-agent delegation — decomposição + workers paralelos | ✅ |
+| PoC | Description | Status |
+|-----|-------------|--------|
+| PoC #1 | Agent ↔ Model via NATS (simple pub/sub) | ✅ |
+| PoC #2 | Multi-turn tool calling with isolated sandbox | ✅ |
+| PoC #3 | Multi-agent delegation — decomposition + parallel workers | ✅ |
 | PoC #4 | Registry, auto-pause/unpause, streaming | 🔜 |
 
-## Estrutura
+## Structure
 
 ```
 camelia/
 ├── containers/
-│   ├── orchestrator/    # Raku — decomposição + síntese
+│   ├── orchestrator/    # Raku — decomposition + synthesis
 │   │   ├── Dockerfile
 │   │   └── orchestrator.raku
-│   ├── worker/          # Raku — agente long-running
+│   ├── worker/          # Raku — long-running agent
 │   │   ├── Dockerfile
 │   │   └── worker.raku
 │   ├── agent/           # Raku — single-agent (PoC #2, legacy)
 │   │   ├── Dockerfile
 │   │   └── agent.raku
-│   ├── model-deepseek/  # Raku — provider LLM
+│   ├── model-deepseek/  # Raku — LLM provider
 │   │   ├── Dockerfile
 │   │   └── service.raku
-│   ├── tool-executor/   # Raku — sandbox de execução
+│   ├── tool-executor/   # Raku — execution sandbox
 │   │   ├── Dockerfile
 │   │   └── service.raku
 │   └── base/            # Raku base image
 │       └── Dockerfile
 ├── lib/
-│   ├── Camelia/         # Módulos Raku compartilhados
-│   └── nats.raku/       # Fork do nats.raku
+│   ├── Camelia/         # Shared Raku modules
+│   └── nats.raku/       # nats.raku fork
 ├── docker-compose.yaml
 ├── .env.example
 └── README.md
 ```
 
-## Rodando
+## Running
 
 ```bash
-# 1. Configure a chave da API
+# 1. Set the API key
 cp .env.example .env
-# Edite .env com sua DEEPSEEK_API_KEY
+# Edit .env with your DEEPSEEK_API_KEY
 
-# 2. Suba o stack (tudo long-running, aguardando mensagens NATS)
+# 2. Start the stack (all long-running, waiting for NATS messages)
 docker compose up -d
 
-# 3. Envie um prompt via NATS CLI
-nats pub orchestrator.task '{"prompt":"Analise /root/camelia: descreva containers/ e lib/"}' --reply inbox
+# 3. Send a prompt via NATS CLI
+nats pub orchestrator.task '{"prompt":"Analyze /root/camelia: describe containers/ and lib/"}' --reply inbox
 
-# Ou com um subscriber esperando a resposta:
-nats sub inbox     # em outro terminal, antes de publicar
+# Or with a subscriber waiting for the response:
+nats sub inbox     # in another terminal, before publishing
 nats pub orchestrator.task '{"prompt":"..."}' --reply inbox
 ```
 
-## Subjects NATS
+## NATS Subjects
 
-| Subject | Direção | Descrição |
-|---------|---------|-----------|
-| `orchestrator.task` | caller → orchestrator | Prompt do usuário (com reply-to inbox) |
-| `worker.{id}.task` | orchestrator → worker | Subtask delegada (hyphens OK after grammar fix) |
-| `model.deepseek.completion` | worker/orch → model | Prompt + histórico + tools |
+| Subject | Direction | Description |
+|---------|-----------|-------------|
+| `orchestrator.task` | caller → orchestrator | User prompt (with reply-to inbox) |
+| `worker.{id}.task` | orchestrator → worker | Delegated subtask (hyphens OK after grammar fix) |
+| `model.deepseek.completion` | worker/orch → model | Prompt + history + tools |
 | `tools.exec.{name}` | worker → executor | Tool call |
-| `_INBOX.*` | todos → todos | Respostas via inbox dinâmico |
+| `_INBOX.*` | all → all | Dynamic inbox replies |
 
-## Licença
+## License
 
 MIT

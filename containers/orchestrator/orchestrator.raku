@@ -1,9 +1,9 @@
 #!/usr/bin/env raku
 # 🌺 Camélia PoC #3 — Orchestrator (Multi-Agent Delegation)
 #
-# Serviço long-running. Toda comunicação via NATS.
-# Subscribe: orchestrator.task  → recebe prompt
-# Reply:     inbox reply-to     → devolve resultado final
+# Long-running service. All communication via NATS.
+# Subscribe: orchestrator.task  → receives prompt
+# Reply:     inbox reply-to     → returns final result
 # Uses react/whenever (same as model-deepseek).
 
 use Nats;
@@ -38,7 +38,7 @@ END
 
 my $synth-system = q:to/END/;
 You are a synthesis agent. Given the original request and individual worker results, combine them into a single coherent response.
-Be concise and direct. Respond in Brazilian Portuguese.
+Be concise and direct.
 END
 
 # Real worker IDs (hyphens now supported after grammar fix)
@@ -46,7 +46,7 @@ my @real-workers = <code-reader doc-writer>;
 
 # ── Connect NATS ──
 
-note "🟡 Orchestrator conectando NATS ($nats-url)...";
+note "🟡 Orchestrator connecting NATS ($nats-url)...";
 my $nats = Nats.new: :servers[$nats-url];
 await $nats.start;
 $nats.connect;
@@ -63,7 +63,7 @@ react {
         next unless $msg.payload;
         my $reply-to = $msg.?reply-to;
         unless $reply-to {
-            note "⚠️ orchestrator.task sem reply-to, ignorando";
+            note "⚠️ orchestrator.task without reply-to, ignoring";
             next;
         }
 
@@ -79,7 +79,7 @@ react {
             next;
         }
 
-        note "📨 Nova tarefa: {$prompt.substr(0, 100)}...";
+        note "📨 New task: {$prompt.substr(0, 100)}...";
 
         # Process in start block so react loop stays free
         start {
@@ -131,7 +131,7 @@ sub call-worker(Str $id, Str $role, Str $task --> Hash) {
 
 sub process-task(Str $prompt, Str $reply-to) {
     # ═══════ STEP 1: Decompose ═══════
-    note "📋 Decompondo...";
+    note "📋 Decomposing...";
     my @decomp-msgs = (
         { :role<system>, :content($decomp-system) },
         { :role<user>,   :content("Decompose this task into parallel subtasks: $prompt") },
@@ -164,7 +164,7 @@ sub process-task(Str $prompt, Str $reply-to) {
     }
 
     # ═══════ STEP 2: Spawn workers in parallel ═══════
-    note "🚀 Spawnando {+@subtasks} workers em paralelo...";
+    note "🚀 Spawning {+@subtasks} workers in parallel...";
     my @promises;
     for @subtasks -> $st {
         @promises.push: start {
@@ -178,12 +178,12 @@ sub process-task(Str $prompt, Str $reply-to) {
         if $r<result><error> {
             note "  ❌ {$r<id>}: {$r<result><error>}";
         } else {
-            note "  ✅ {$r<id>} concluído";
+            note "  ✅ {$r<id>} done";
         }
     }
 
     # ═══════ STEP 3: Synthesize ═══════
-    note "🧠 Sintetizando...";
+    note "🧠 Synthesizing...";
     my $results-block = '';
     for @results -> $r {
         $results-block ~= "=== {$r<id>} ({$r<role>}) ===\n";
@@ -203,5 +203,5 @@ sub process-task(Str $prompt, Str $reply-to) {
 
     my $final = %s-resp<choices>[0]<message><content> // '';
     $nats.publish: $reply-to, to-json({ :result($final), :subtask_count(+@subtasks) });
-    note "✅ Resposta enviada ao caller.";
+    note "✅ Response sent to caller.";
 }
