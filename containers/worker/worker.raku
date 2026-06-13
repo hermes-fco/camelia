@@ -1,9 +1,9 @@
 #!/usr/bin/env raku
-# 🌺 Camélia PoC #4 — Worker Agent (JetStream pull consumer)
+# 🌺 Camélia PoC #5 — Worker Agent (JetStream pull consumer + progress streaming)
 #
 # Pulls tasks from JetStream consumer, processes via model+tool loop,
 # idles for 5 minutes then self-terminates.
-# Queue group ensures one task per worker.
+# NEW: streams partial progress to session.<id>.worker.<id>.progress
 
 use Nats;
 use JSON::Fast;
@@ -115,17 +115,31 @@ loop {
     my %task = try from-json($msg.payload);
     if $! {
         note "⚠️ Invalid JSON, acking and skipping";
-        ack($nats, $msg, $stream, $consumer);
+        $consumer.ack($msg) if $msg;
         next;
     }
 
-    my $task-text = %task<task> // 'Execute a task';
-    my $role      = %task<role> // 'worker';
-    my $task-id   = %task<id>   // 'unknown';
-    note "📨 Worker {$worker-id}: task {$task-id} — {$task-text.substr(0, 100)}...";
+    my $task-text  = %task<task>       // 'Execute a task';
+    my $role       = %task<role>       // 'worker';
+    my $task-id    = %task<id>         // 'unknown';
+    my $session-id = %task<session-id> // '';           # ✨ NEW: session for progress streaming
 
-    # Process the task
-    my $result = process-one-task($nats, $task-text, $role, $worker-id);
+    note "📨 Worker {$worker-id}: task {$task-id} — {$task-text.substr(0, 100)}..." ~
+        ($session-id ?? " [session: $session-id]" !! "");
+
+    # ✨ NEW: announce that we started
+    if $session-id {
+        $nats.publish: "session.{$session-id}.worker.{$worker-id}.progress", to-json({
+            :$worker-id,
+            :$task-id,
+            :$role,
+            :status<started>,
+            :message("Worker started on task {$task-id}"),
+        });
+    }
+
+    # Process the task (pass session-id for progress streaming)
+    my $result = process-one-task($nats, $task-text, $role, $worker-id, $session-id);
 
     # Send result back if reply-to was provided
     if %task<reply-to> {
@@ -137,8 +151,19 @@ loop {
         });
     }
 
+    # ✨ NEW: announce completion
+    if $session-id {
+        $nats.publish: "session.{$session-id}.worker.{$worker-id}.progress", to-json({
+            :$worker-id,
+            :$task-id,
+            :$role,
+            :status<completed>,
+            :message("Worker completed task {$task-id}"),
+        });
+    }
+
     # Ack the JetStream message
-    ack($nats, $msg, $stream, $consumer);
+    $consumer.ack($msg) if $msg;
     $tasks-done++;
 
     note "✅ Worker {$worker-id}: task {$task-id} complete ({$tasks-done} total)";
@@ -151,11 +176,23 @@ exit 0;
 # HELPERS
 # ═════════════════════════════════════════════
 
-sub ack($nats, $msg, $stream, $consumer) {
-    $consumer.ack($msg) if $msg;
+# ✨ NEW: stream partial progress to session
+sub stream-progress($session-id, $worker-id, $task-id, $role, $status, :$content, :$tool-name, :$turn) {
+    return unless $session-id;
+    my %payload = {
+        :$worker-id,
+        :$task-id,
+        :$role,
+        :$status,
+    };
+    %payload<content>   = $content   if $content;
+    %payload<tool_name> = $tool-name if $tool-name;
+    %payload<turn>      = $turn      if $turn;
+
+    $nats.publish: "session.{$session-id}.worker.{$worker-id}.progress", to-json(%payload);
 }
 
-sub process-one-task($nats, Str $task, Str $role, Str $worker-id --> Str) {
+sub process-one-task($nats, Str $task, Str $role, Str $worker-id, Str $session-id? --> Str) {
     my @messages = (
         { :role<system>, :content($system ~ "\n\nYour role in this task: {$role}") },
         { :role<user>,   :content($task) },
@@ -163,14 +200,17 @@ sub process-one-task($nats, Str $task, Str $role, Str $worker-id --> Str) {
 
     my $final-content = '';
     my $max-turns = 8;
+    my $turn = 0;
 
     loop {
         last if $max-turns-- <= 0;
+        $turn++;
 
         my %resp = call-model($nats, @messages);
         if %resp<error> {
             note "  ❌ Model error: {%resp<error>}";
             $final-content = "ERROR: {%resp<error>}";
+            stream-progress($session-id, $worker-id, '', $role, 'error', :content(%resp<error>));
             last;
         }
 
@@ -186,6 +226,12 @@ sub process-one-task($nats, Str $task, Str $role, Str $worker-id --> Str) {
         if $message<content> {
             note "  💬 {$worker-id}: {$message<content>.substr(0, 100)}...";
             $final-content = $message<content>;
+
+            # ✨ Stream content progress (truncated)
+            stream-progress($session-id, $worker-id, '', $role, 'thinking',
+                :content($message<content>.substr(0, 300)),
+                :$turn,
+            );
         }
 
         if $finish eq 'tool_calls' || $message<tool_calls> {
@@ -201,6 +247,12 @@ sub process-one-task($nats, Str $task, Str $role, Str $worker-id --> Str) {
                 my $tc-id = $tc<id> // 'unknown';
 
                 note "    ⚙️ {$name}";
+                # ✨ Stream tool call
+                stream-progress($session-id, $worker-id, $tc-id, $role, 'tool_call',
+                    :tool-name($name),
+                    :$turn,
+                );
+
                 my %result = exec-tool($nats, $name, $tc-id, %args);
                 @messages.push: {
                     :role<tool>,
@@ -216,6 +268,10 @@ sub process-one-task($nats, Str $task, Str $role, Str $worker-id --> Str) {
         if $finish eq 'stop' {
             @messages.push: $message;
             note "  ✅ {$worker-id} finished task";
+            stream-progress($session-id, $worker-id, '', $role, 'finished',
+                :content($final-content.substr(0, 300)),
+                :$turn,
+            );
             last;
         }
 

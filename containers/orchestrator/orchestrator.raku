@@ -1,8 +1,9 @@
 #!/usr/bin/env raku
-# 🌺 Camélia PoC #4 — Orchestrator (Worker Pool via JetStream)
+# 🌺 Camélia PoC #5 — Orchestrator (Streaming + Session Context)
 #
 # Decomposes tasks, publishes to JetStream stream, asks spawner
 # to ensure workers, collects results, synthesizes final response.
+# NEW: session management, streaming progress, conversation history.
 
 use Nats;
 use JSON::Fast;
@@ -12,12 +13,15 @@ $*ERR.out-buffer = False;
 my $nats-url     = %*ENV<NATS_URL>      // 'nats://127.0.0.1:4222';
 my $max-workers  = %*ENV<MAX_WORKERS>    // 3;
 
+# ── Session state ──
+my %sessions;  # session_id => { :history(@), :created_at(Instant), :task_count(Int) }
+
 # ── System prompts ──
 
 my $decomp-system = q:to/END/;
 You are a task orchestrator. Your job is to break down complex tasks into parallel subtasks.
 
-Given a user request, decompose it into 2-3 INDEPENDENT subtasks that can be executed in parallel by worker agents.
+Given a user request — and optionally conversation history — decompose it into 2-3 INDEPENDENT subtasks that can be executed in parallel by worker agents.
 Each worker can: run shell commands, read files, write files.
 
 Output ONLY a JSON array of subtask objects:
@@ -32,12 +36,13 @@ Output ONLY a JSON array of subtask objects:
 Rules:
 - Subtasks MUST be independent (no dependencies between them)
 - Each subtask must be self-contained with all needed context
+- If conversation history is provided, use it to maintain continuity
 - Output ONLY the JSON array, nothing else — no markdown fences, no explanations
 END
 
 my $synth-system = q:to/END/;
 You are a synthesis agent. Given the original request and individual worker results, combine them into a single coherent response.
-Be concise and direct.
+Be concise and direct. If there is previous conversation history, maintain continuity.
 END
 
 # ── Connect NATS ──
@@ -68,18 +73,36 @@ react {
             next;
         }
 
-        my $prompt = %req<prompt> // '';
+        my $prompt     = %req<prompt>     // '';
+        my $session-id = %req<session_id> // '';
+
         unless $prompt {
             $nats.publish: $reply-to, to-json({ :error("Missing 'prompt' field") });
             next;
         }
 
-        note "📨 New task: {$prompt.substr(0, 100)}...";
+        note "📨 New task: {$prompt.substr(0, 100)}..." ~
+            ($session-id ?? " (session: $session-id)" !! "");
 
         start {
-            process-task($prompt, $reply-to);
+            process-task($prompt, $reply-to, $session-id);
         }
     }
+}
+
+# ═════════════════════════════════════════════
+# STREAMING HELPER
+# ═════════════════════════════════════════════
+
+sub stream(Str $session-id, Str $status, :$message, :$data, :$subtask_count, :$result) {
+    my %payload = :$status;
+    %payload<message>       = $message       if $message;
+    %payload<data>          = $data          if $data;
+    %payload<subtask_count> = $subtask_count if $subtask_count;
+    %payload<result>        = $result        if $result;
+
+    my $subject = "session.{$session-id}.stream";
+    $nats.publish: $subject, to-json(%payload);
 }
 
 # ═════════════════════════════════════════════
@@ -159,17 +182,37 @@ sub spawn-workers(Int $count --> Hash) {
     try from-json($msg.payload) // { :error("Spawner JSON parse fail") };
 }
 
-sub process-task(Str $prompt, Str $reply-to) {
-    # ═══════ STEP 1: Decompose ═══════
-    note "📋 Decomposing...";
+sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
+    # ═══════ SESSION MANAGEMENT ═══════
+    my $sid = $session-id ?? $session-id !! ('sess-' ~ (('a'..'z').pick xx 8).join);
+    unless %sessions{$sid} {
+        %sessions{$sid} = {
+            history     => [],
+            created_at  => now,
+            task_count  => 0,
+        };
+        note "🆕 New session: {$sid}";
+    }
+    %sessions{$sid}<task_count>++;
+
+    stream($sid, 'received', :message("Task received: {$prompt.substr(0, 80)}..."));
+
+    # ═══════ STEP 1: Decompose (with history) ═══════
+    note "📋 Decomposing (session {$sid}, task #{%sessions{$sid}<task_count>})...";
     my @decomp-msgs = (
         { :role<system>, :content($decomp-system) },
-        { :role<user>,   :content("Decompose this task into parallel subtasks: $prompt") },
     );
+    # Include conversation history for context
+    for %sessions{$sid}<history>.Array -> $entry {
+        @decomp-msgs.push: $entry;
+    }
+    @decomp-msgs.push: { :role<user>, :content("Decompose this task into parallel subtasks: $prompt") };
 
     my %d-resp = call-model(@decomp-msgs, :temperature(0.1));
     if %d-resp<error> {
-        $nats.publish: $reply-to, to-json({ :error("Decomposition failed: {%d-resp<error>}") });
+        my $err = "Decomposition failed: {%d-resp<error>}";
+        $nats.publish: $reply-to, to-json({ :error($err) });
+        stream($sid, 'error', :message($err));
         return;
     }
 
@@ -179,7 +222,9 @@ sub process-task(Str $prompt, Str $reply-to) {
 
     my @subtasks = try from-json($raw);
     if $! || @subtasks.elems == 0 {
-        $nats.publish: $reply-to, to-json({ :error("Failed to parse subtasks: $!") });
+        my $err = "Failed to parse subtasks: $!";
+        $nats.publish: $reply-to, to-json({ :error($err) });
+        stream($sid, 'error', :message($err));
         return;
     }
 
@@ -187,6 +232,11 @@ sub process-task(Str $prompt, Str $reply-to) {
     for @subtasks -> $st {
         note "  • {$st<id>} ({$st<role>})";
     }
+
+    stream($sid, 'decomposed',
+        :message("Decomposed into {+@subtasks} subtasks"),
+        :subtask_count(+@subtasks),
+    );
 
     # ═══════ STEP 2: Publish tasks to JetStream + subscribe to results ═══════
     note "📤 Publishing {+@subtasks} tasks to worker.task.* stream...";
@@ -206,12 +256,13 @@ sub process-task(Str $prompt, Str $reply-to) {
         };
         @result-promises.push: $result-promise;
 
-        # Publish to JetStream subject
+        # Publish to JetStream subject — include session_id for progress streaming
         $nats.publish: "worker.task.{$task-id}", to-json({
             :id($task-id),
             :role($st<role>),
             :task($st<task>),
             :reply-to($result-inbox),
+            :session-id($sid),            # so worker can stream progress
         });
 
         note "  📤 {$task-id} → worker.task.{$task-id}";
@@ -223,6 +274,9 @@ sub process-task(Str $prompt, Str $reply-to) {
     my %spawn-resp = spawn-workers($needed);
     if %spawn-resp<ok> {
         note "  ✅ Spawner: {(%spawn-resp<workers> // []).join(', ')}";
+        stream($sid, 'workers-ready',
+            :message("{%spawn-resp<workers>.elems} worker(s) started"),
+        );
     } else {
         note "  ⚠️ Spawner warning: {%spawn-resp<message> // 'unknown'}";
     }
@@ -231,16 +285,24 @@ sub process-task(Str $prompt, Str $reply-to) {
     note "⏳ Waiting for {+@result-promises} worker result(s)...";
     my @results = await Promise.allof(@result-promises).then({ @result-promises.map(*.result) }).result;
 
+    my $done-count = 0;
     for @results -> $r {
         if $r<error> {
             note "  ❌ {$r<worker-id> // '?'}: {$r<error>}";
         } else {
+            $done-count++;
             note "  ✅ {$r<worker-id> // '?'}: {$r<task-id> // '?'} done";
         }
     }
 
+    stream($sid, 'results-collected',
+        :message("{$done-count}/{+@results} worker results collected"),
+    );
+
     # ═══════ STEP 5: Synthesize ═══════
     note "🧠 Synthesizing...";
+    stream($sid, 'synthesizing', :message("Synthesizing final response..."));
+
     my $results-block = '';
     for @results.kv -> $i, $r {
         my $label = $r<worker-id> // "worker-{$i}";
@@ -249,17 +311,43 @@ sub process-task(Str $prompt, Str $reply-to) {
     }
 
     my @synth-msgs = (
-        { :role<system>, :content($synth-system) },
-        { :role<user>,   :content("Original request: $prompt\n\nWorker results:\n$results-block\n\nSynthesize a final response.") },
+        { :role<system>, :content($synth-system ~ "\n\nSession ID: {$sid}") },
     );
+    for %sessions{$sid}<history>.Array -> $entry {
+        @synth-msgs.push: $entry;
+    }
+    @synth-msgs.push: {
+        :role<user>,
+        :content("Original request: $prompt\n\nWorker results:\n$results-block\n\nSynthesize a final response."),
+    };
 
     my %s-resp = call-model(@synth-msgs);
     if %s-resp<error> {
-        $nats.publish: $reply-to, to-json({ :error("Synthesis failed: {%s-resp<error>}") });
+        my $err = "Synthesis failed: {%s-resp<error>}";
+        $nats.publish: $reply-to, to-json({ :error($err) });
+        stream($sid, 'error', :message($err));
         return;
     }
 
     my $final = %s-resp<choices>[0]<message><content> // '';
-    $nats.publish: $reply-to, to-json({ :result($final), :subtask_count(+@subtasks), :mode<jetstream-pool> });
-    note "✅ Response sent to caller.";
+
+    # ── Update session history ──
+    %sessions{$sid}<history>.push: { :role<user>,      :content($prompt) };
+    %sessions{$sid}<history>.push: { :role<assistant>, :content($final) };
+
+    # ── Send final response ──
+    $nats.publish: $reply-to, to-json({
+        :result($final),
+        :session_id($sid),
+        :subtask_count(+@subtasks),
+        :mode<jetstream-pool>,
+    });
+
+    stream($sid, 'done',
+        :message("Response ready"),
+        :$result($final),
+        :subtask_count(+@subtasks),
+    );
+
+    note "✅ Response sent to caller (session {$sid}).";
 }
