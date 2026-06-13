@@ -90,9 +90,14 @@ react {
 
 sub docker-api(Str $method, Str $path, Str $body?) {
     my $url = "http://localhost" ~ $path;
+    my $tmpfile = $body ?? "/tmp/docker-api-{(^10000).pick}.json" !! Nil;
+    if $tmpfile {
+        spurt $tmpfile, $body;
+        END { unlink $tmpfile if $tmpfile.IO.e }
+    }
     my $cmd = "curl -s --unix-socket {$docker-sock} -X {$method}"
             ~ " -H 'Content-Type: application/json'";
-    $cmd ~= " -d '{shell-escape($body)}'" if $body;
+    $cmd ~= ' -d @' ~ $tmpfile if $tmpfile;
     $cmd ~= " {$url}";
 
     my $proc = shell($cmd, :out, :err);
@@ -108,10 +113,6 @@ sub docker-api(Str $method, Str $path, Str $body?) {
     return { :ok(True) } unless $output.trim;
 
     try from-json($output) // { :error("Invalid JSON from Docker API") };
-}
-
-sub shell-escape(Str $s --> Str) {
-    $s.trans(['"', '\\'] => ['\"', '\\\\'])
 }
 
 # ═════════════════════════════════════════════
@@ -154,7 +155,7 @@ sub handle-ensure(Int $desired, Str $reply-to) {
             :Image($worker-image),
             :Hostname($worker-name),
             :Env(["NATS_URL=nats://camelia-nats:4222"]),
-            HostConfig => { :NetworkMode<camelia> },
+            HostConfig => { :NetworkMode<camelia-net> },
         });
 
         # Step 1: Create container

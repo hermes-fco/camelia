@@ -64,29 +64,22 @@ sub handle-msg(Str $op, $msg, &handler) {
 # ═════════════════════════════════════════════
 
 react {
-    note "DEBUG: entering react with 6 whenever blocks";
     whenever $create-sub.supply -> $msg {
-        note "DEBUG: create-supply fired!";
         handle-msg('create', $msg, &handle-create);
     }
     whenever $get-sub.supply -> $msg {
-        note "DEBUG: get-supply fired!";
         handle-msg('get', $msg, &handle-get);
     }
     whenever $append-sub.supply -> $msg {
-        note "DEBUG: append fired!";
         handle-msg('append', $msg, &handle-append);
     }
     whenever $list-sub.supply -> $msg {
-        note "DEBUG: list fired!";
         handle-msg('list', $msg, -> $reply-to, %req { handle-list($reply-to) });
     }
     whenever $delete-sub.supply -> $msg {
-        note "DEBUG: delete fired!";
         handle-msg('delete', $msg, &handle-delete);
     }
     whenever $health-sub.supply -> $msg {
-        note "DEBUG: health fired!";
         if $msg.?reply-to {
             $nats.publish: $msg.reply-to, to-json({ :status<ok>, :service<session-store> });
         }
@@ -125,13 +118,13 @@ sub handle-create(Str $reply-to, %req) {
     my $sid = 'sess-' ~ (('a'..'z').pick xx 8).join;
     my $now = DateTime.now.utc.Str;
 
-    my %session = {
+    my %session = %(
         :session_id($sid),
         :created_at($now),
         :task_count(0),
         :seq(0),
         :history([]),
-    };
+    );
 
     my $subject = "session.data.{$sid}";
     $nats.publish: $subject, to-json(%session);

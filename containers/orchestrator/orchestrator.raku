@@ -243,7 +243,7 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
     my %session = session-load($session-id);
     if %session<error> {
         $nats.publish: $reply-to, to-json({ :error("Session-store unavailable: {%session<error>}") });
-        stream($session-id // 'unknown', 'error', :message("Session-store unavailable"));
+        stream($session-id || 'unknown', 'error', :message("Session-store unavailable"));
         return;
     }
     my $sid     = %session<session_id>;
@@ -356,7 +356,26 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
         :message("{$done-count}/{+@results} worker results collected"),
     );
 
-    # ═══════ STEP 5: Synthesize (with history) ═══════
+    # ═══════ STEP 5: Handle results ═══════
+    if $done-count == 0 {
+        note "⚠️ No workers completed — graceful degradation";
+        my $err-msg = "Unable to process your request right now — no workers available. Please try again later.";
+        session-append-batch($sid, $seq, [
+            { :role<user>,      :content($prompt) },
+            { :role<assistant>, :content($err-msg) },
+        ]);
+        $nats.publish: $reply-to, to-json({
+            :error($err-msg),
+            :session_id($sid),
+            :subtask_count(+@subtasks),
+        });
+        stream($sid, 'degraded', :message("Graceful degradation: 0/{+@subtasks} workers completed"));
+        note "✅ Graceful degradation response sent (session {$sid}).";
+        $tasks-done++;
+        return;
+    }
+
+    # ═══════ STEP 6: Synthesize (with history) ═══════
     note "🧠 Synthesizing...";
     stream($sid, 'synthesizing', :message("Synthesizing final response..."));
 
