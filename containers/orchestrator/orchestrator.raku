@@ -41,8 +41,8 @@ You are a synthesis agent. Given the original request and individual worker resu
 Be concise and direct. Respond in Brazilian Portuguese.
 END
 
-# Real worker IDs
-my @real-workers = <code_reader doc_writer>;
+# Real worker IDs (hyphens now supported after grammar fix)
+my @real-workers = <code-reader doc-writer>;
 
 # ── Connect NATS ──
 

@@ -124,7 +124,7 @@ nats pub orchestrator.task '{"prompt":"..."}' --reply inbox
 | Subject | Direção | Descrição |
 |---------|---------|-----------|
 | `orchestrator.task` | caller → orchestrator | Prompt do usuário (com reply-to inbox) |
-| `worker.{id}.task` | orchestrator → worker | Subtask delegada (use `_` not `-` in ID) |
+| `worker.{id}.task` | orchestrator → worker | Subtask delegada (hyphens OK after grammar fix) |
 | `model.deepseek.completion` | worker/orch → model | Prompt + histórico + tools |
 | `tools.exec.{name}` | worker → executor | Tool call |
 | `_INBOX.*` | todos → todos | Respostas via inbox dinâmico |
