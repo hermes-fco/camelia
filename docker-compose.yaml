@@ -1,6 +1,6 @@
-# 🌺 Camélia PoC #4 — Worker Pool with JetStream + Auto-Scaling
-# 7 containers: nats, model-deepseek, tool-executor,
-#               orchestrator, spawner (+ dynamic workers)
+# 🌺 Camélia PoC #6 — Persistence + Resilience
+# 8 containers: nats, model-deepseek, tool-executor,
+#               orchestrator, spawner, session-store (+ dynamic workers)
 
 services:
   nats:
@@ -22,7 +22,7 @@ services:
         condition: service_healthy
     environment:
       - NATS_URL=nats://nats:4222
-      - DEEPSEEK_API_KEY=${DE...KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - SERVICE_NAME=model-deepseek
 
   tool-executor:
@@ -37,6 +37,17 @@ services:
       - NATS_URL=nats://nats:4222
       - SANDBOX_DIR=/tmp/sandbox
 
+  session-store:
+    build:
+      context: .
+      dockerfile: containers/session-store/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      - NATS_URL=nats://nats:4222
+
   orchestrator:
     build:
       context: .
@@ -48,6 +59,8 @@ services:
       model-deepseek:
         condition: service_started
       tool-executor:
+        condition: service_started
+      session-store:
         condition: service_started
     environment:
       - NATS_URL=nats://nats:4222

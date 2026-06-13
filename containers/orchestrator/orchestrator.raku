@@ -1,9 +1,9 @@
 #!/usr/bin/env raku
-# 🌺 Camélia PoC #5 — Orchestrator (Streaming + Session Context)
+# 🌺 Camélia PoC #6 — Orchestrator (Persistence + Session Store)
 #
 # Decomposes tasks, publishes to JetStream stream, asks spawner
 # to ensure workers, collects results, synthesizes final response.
-# NEW: session management, streaming progress, conversation history.
+# Sessions persisted via session-store (isolated container).
 
 use Nats;
 use JSON::Fast;
@@ -12,9 +12,6 @@ $*ERR.out-buffer = False;
 
 my $nats-url     = %*ENV<NATS_URL>      // 'nats://127.0.0.1:4222';
 my $max-workers  = %*ENV<MAX_WORKERS>    // 3;
-
-# ── Session state ──
-my %sessions;  # session_id => { :history(@), :created_at(Instant), :task_count(Int) }
 
 # ── System prompts ──
 
@@ -106,6 +103,63 @@ sub stream(Str $session-id, Str $status, :$message, :$data, :$subtask_count, :$r
 }
 
 # ═════════════════════════════════════════════
+# SESSION STORE HELPERS (remote calls via NATS)
+# ═════════════════════════════════════════════
+
+sub session-call(Str $op, %payload --> Hash) {
+    my $inbox = "_INBOX.ss." ~ (('a'..'z').pick xx 10).join;
+    my $sub   = $nats.subscribe: $inbox;
+    my $reply = start await $sub.supply.head.Promise;
+
+    $nats.publish: "session.store.{$op}", to-json(%payload), :reply-to($inbox);
+
+    my $msg = await $reply;
+    $nats.unsubscribe: $sub;
+
+    return { :error("No response from session-store") } unless $msg && $msg.payload;
+    try from-json($msg.payload) // { :error("Session-store JSON parse fail") };
+}
+
+sub session-load(Str $sid? --> Hash) {
+    # If session_id provided, try to load it
+    if $sid {
+        my %resp = session-call('get', { :session_id($sid) });
+        if %resp<ok> && %resp<session> {
+            note "📂 Loaded session {$sid} ({+%resp<session><history>} history entries)";
+            return %resp<session>;
+        }
+    }
+
+    # Create new session
+    my %resp = session-call('create', {});
+    if %resp<ok> && %resp<session> {
+        note "🆕 New session: {%resp<session_id>}";
+        return %resp<session>;
+    }
+
+    # Fallback: create in-memory stub (shouldn't happen if session-store is up)
+    note "⚠️ Session-store unreachable, using ephemeral stub";
+    my $fallback-id = 'sess-' ~ (('a'..'z').pick xx 8).join;
+    return {
+        :session_id($fallback-id),
+        :created_at(DateTime.now.utc.Str),
+        :task_count(0),
+        :history([]),
+    };
+}
+
+sub session-append(Str $sid, Str $role, Str $content) {
+    my %resp = session-call('append', {
+        :session_id($sid),
+        :$role,
+        :$content,
+    });
+    if %resp<error> {
+        note "⚠️ Session append failed: {%resp<error>}";
+    }
+}
+
+# ═════════════════════════════════════════════
 # JETSTREAM SETUP
 # ═════════════════════════════════════════════
 
@@ -183,27 +237,20 @@ sub spawn-workers(Int $count --> Hash) {
 }
 
 sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
-    # ═══════ SESSION MANAGEMENT ═══════
-    my $sid = $session-id ?? $session-id !! ('sess-' ~ (('a'..'z').pick xx 8).join);
-    unless %sessions{$sid} {
-        %sessions{$sid} = {
-            history     => [],
-            created_at  => now,
-            task_count  => 0,
-        };
-        note "🆕 New session: {$sid}";
-    }
-    %sessions{$sid}<task_count>++;
+    # ═══════ SESSION: load from session-store ═══════
+    my %session = session-load($session-id);
+    my $sid     = %session<session_id>;
+    my @history = %session<history>.List;
+    my $task-n  = (%session<task_count> // 0) + 1;
 
     stream($sid, 'received', :message("Task received: {$prompt.substr(0, 80)}..."));
 
-    # ═══════ STEP 1: Decompose (with history) ═══════
-    note "📋 Decomposing (session {$sid}, task #{%sessions{$sid}<task_count>})...";
+    # ═══════ STEP 1: Decompose (with history from session-store) ═══════
+    note "📋 Decomposing (session {$sid}, task #{$task-n})...";
     my @decomp-msgs = (
         { :role<system>, :content($decomp-system) },
     );
-    # Include conversation history for context
-    for %sessions{$sid}<history>.Array -> $entry {
+    for @history -> $entry {
         @decomp-msgs.push: $entry;
     }
     @decomp-msgs.push: { :role<user>, :content("Decompose this task into parallel subtasks: $prompt") };
@@ -246,7 +293,6 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
         my $task-id   = $st<id> // ('task-' ~ (^1000).pick);
         my $result-inbox = "_INBOX.result.{$task-id}." ~ (('a'..'z').pick xx 8).join;
 
-        # Subscribe BEFORE publishing (avoids race)
         my $result-sub = $nats.subscribe: $result-inbox;
         my $result-promise = start {
             my $msg = await $result-sub.supply.head.Promise;
@@ -256,13 +302,12 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
         };
         @result-promises.push: $result-promise;
 
-        # Publish to JetStream subject — include session_id for progress streaming
         $nats.publish: "worker.task.{$task-id}", to-json({
             :id($task-id),
             :role($st<role>),
             :task($st<task>),
             :reply-to($result-inbox),
-            :session-id($sid),            # so worker can stream progress
+            :session-id($sid),
         });
 
         note "  📤 {$task-id} → worker.task.{$task-id}";
@@ -299,7 +344,7 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
         :message("{$done-count}/{+@results} worker results collected"),
     );
 
-    # ═══════ STEP 5: Synthesize ═══════
+    # ═══════ STEP 5: Synthesize (with history) ═══════
     note "🧠 Synthesizing...";
     stream($sid, 'synthesizing', :message("Synthesizing final response..."));
 
@@ -313,7 +358,7 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
     my @synth-msgs = (
         { :role<system>, :content($synth-system ~ "\n\nSession ID: {$sid}") },
     );
-    for %sessions{$sid}<history>.Array -> $entry {
+    for @history -> $entry {
         @synth-msgs.push: $entry;
     }
     @synth-msgs.push: {
@@ -331,9 +376,9 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
 
     my $final = %s-resp<choices>[0]<message><content> // '';
 
-    # ── Update session history ──
-    %sessions{$sid}<history>.push: { :role<user>,      :content($prompt) };
-    %sessions{$sid}<history>.push: { :role<assistant>, :content($final) };
+    # ── Persist session history ──
+    session-append($sid, 'user', $prompt);
+    session-append($sid, 'assistant', $final);
 
     # ── Send final response ──
     $nats.publish: $reply-to, to-json({

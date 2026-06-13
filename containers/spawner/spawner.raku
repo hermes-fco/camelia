@@ -1,9 +1,10 @@
 #!/usr/bin/env raku
-# 🌺 Camélia PoC #4 — Worker Pool Spawner (Docker REST API)
+# 🌺 Camélia PoC #6 — Worker Pool Spawner (Docker REST API + GC)
 #
 # Long-running service with Docker socket access.
 # Manages worker containers via Docker REST API (curl).
 # All communication via NATS (subscribe: spawner.control).
+# NEW: periodic GC — cleans up zombie/idle worker containers.
 
 use Nats;
 use JSON::Fast;
@@ -66,6 +67,11 @@ react {
                 $nats.publish: $reply-to, to-json({ :error("Unknown action: $action") });
             }
         }
+    }
+
+    # ═══════ GC: periodic zombie cleanup (every 60s) ═══════
+    whenever Supply.interval(60) {
+        handle-gc();
     }
 }
 
@@ -190,4 +196,76 @@ sub handle-stop-all(Str $reply-to) {
         :ok(True),
         :stopped(@stopped),
     });
+}
+
+# ═════════════════════════════════════════════
+# WORKER GC — cleans up zombie/idle containers
+# ═════════════════════════════════════════════
+
+sub handle-gc() {
+    # List ALL containers (including exited)
+    my %list = docker-api('GET', '/containers/json?all=true');
+    return if %list<error>;
+
+    my @containers = %list.List;  # JSON array → Raku list
+    return unless @containers.elems;
+
+    my $now = now.Int;
+    my $max-age = 900;  # 15 minutes max lifetime for a worker
+
+    my ($zombies, $pruned) = (0, 0);
+
+    for @containers -> $c {
+        my @names = ($c<Names> // []).List;
+        my $is-worker = False;
+        for @names -> $n {
+            if $n.starts-with('/camelia-worker') {
+                $is-worker = True;
+                last;
+            }
+        }
+        next unless $is-worker;
+
+        my $cid    = $c<Id> // '';
+        my $state  = $c<State> // '';
+        my $created = $c<Created> // 0;  # Unix timestamp
+
+        # Remove exited/dead containers immediately
+        if $state eq 'exited' | 'dead' {
+            note "  🧹 GC: removing dead worker {$cid} (state={$state})";
+            docker-api('DELETE', "/containers/{$cid}");
+            %active-workers{$cid}:delete;
+            $zombies++;
+            next;
+        }
+
+        # Kill running workers that exceed max lifetime
+        if $state eq 'running' && $created > 0 {
+            my $age = $now - $created;
+            if $age > $max-age {
+                note "  🧹 GC: killing stale worker {$cid} (age={$age}s, max={$max-age}s)";
+                docker-api('POST', "/containers/{$cid}/stop");
+                docker-api('DELETE', "/containers/{$cid}");
+                %active-workers{$cid}:delete;
+                $pruned++;
+            }
+        }
+    }
+
+    # Prune active-workers entries for containers that no longer exist
+    for %active-workers.keys -> $cid {
+        my $found = False;
+        for @containers -> $c {
+            if ($c<Id> // '') eq $cid { $found = True; last }
+        }
+        unless $found {
+            note "  🧹 GC: pruning stale tracking entry {$cid}";
+            %active-workers{$cid}:delete;
+            $pruned++;
+        }
+    }
+
+    if $zombies || $pruned {
+        note "🧹 GC done: {$zombies} zombies, {$pruned} pruned, {%active-workers.elems} active";
+    }
 }
