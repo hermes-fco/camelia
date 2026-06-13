@@ -1,6 +1,6 @@
-# 🌺 Camélia PoC #3 — Multi-Agent Delegation
-# 6 containers: nats, model-deepseek, tool-executor,
-#               worker-code-reader, worker-doc-writer, orchestrator
+# 🌺 Camélia PoC #4 — Worker Pool with JetStream + Auto-Scaling
+# 7 containers: nats, model-deepseek, tool-executor,
+#               orchestrator, spawner (+ dynamic workers)
 
 services:
   nats:
@@ -22,7 +22,7 @@ services:
         condition: service_healthy
     environment:
       - NATS_URL=nats://nats:4222
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - DEEPSEEK_API_KEY=${DE...KEY}
       - SERVICE_NAME=model-deepseek
 
   tool-executor:
@@ -37,38 +37,6 @@ services:
       - NATS_URL=nats://nats:4222
       - SANDBOX_DIR=/tmp/sandbox
 
-  worker-code-reader:
-    build:
-      context: .
-      dockerfile: containers/worker/Dockerfile
-    networks: [camelia]
-    depends_on:
-      nats:
-        condition: service_healthy
-      model-deepseek:
-        condition: service_started
-      tool-executor:
-        condition: service_started
-    environment:
-      - NATS_URL=nats://nats:4222
-      - WORKER_ID=code-reader
-
-  worker-doc-writer:
-    build:
-      context: .
-      dockerfile: containers/worker/Dockerfile
-    networks: [camelia]
-    depends_on:
-      nats:
-        condition: service_healthy
-      model-deepseek:
-        condition: service_started
-      tool-executor:
-        condition: service_started
-    environment:
-      - NATS_URL=nats://nats:4222
-      - WORKER_ID=doc-writer
-
   orchestrator:
     build:
       context: .
@@ -81,13 +49,25 @@ services:
         condition: service_started
       tool-executor:
         condition: service_started
-      worker-code-reader:
-        condition: service_started
-      worker-doc-writer:
-        condition: service_started
     environment:
       - NATS_URL=nats://nats:4222
       - SERVICE_NAME=orchestrator
+      - MAX_WORKERS=3
+
+  spawner:
+    build:
+      context: .
+      dockerfile: containers/spawner/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      - NATS_URL=nats://nats:4222
+      - MAX_WORKERS=3
+      - WORKER_IMAGE=camelia-worker:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
 
 networks:
   camelia:

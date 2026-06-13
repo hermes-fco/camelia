@@ -1,10 +1,9 @@
 #!/usr/bin/env raku
-# 🌺 Camélia PoC #3 — Worker Agent (long-running)
+# 🌺 Camélia PoC #4 — Worker Agent (JetStream pull consumer)
 #
-# Subscribes to worker.<WORKER_ID>.task, processes each task
-# through the model+tool loop, returns final result via inbox.
-# Uses react/whenever (same as model-deepseek).
-# Spawns start{} inside whenever to keep react loop free.
+# Pulls tasks from JetStream consumer, processes via model+tool loop,
+# idles for 5 minutes then self-terminates.
+# Queue group ensures one task per worker.
 
 use Nats;
 use JSON::Fast;
@@ -12,8 +11,7 @@ use JSON::Fast;
 $*ERR.out-buffer = False;
 
 my $nats-url  = %*ENV<NATS_URL>  // 'nats://127.0.0.1:4222';
-my $worker-id = %*ENV<WORKER_ID> // 'default';
-my $subject   = "worker.{$worker-id}.task";
+my $worker-id = ('a'..'z').pick(6).join;  # random short ID
 
 # ── Tools schema ──
 my @tools = (
@@ -76,37 +74,88 @@ await $nats.start;
 $nats.connect;
 note "🟢 Worker {$worker-id} connected.";
 
-my $task-sub = $nats.subscribe: $subject;
-note "🟢 Subscribed {$subject}, entering react...";
+# ── JetStream consumer (stream created by orchestrator) ──
+my $stream = Nats::Stream.new:
+    :$nats,
+    :name<WORKER_TASKS>,
+    :subjects(['worker.task.>']),
+    ;
 
-react {
-    whenever $task-sub.supply -> $msg {
-        next unless $msg.payload;
-        my $reply-to = $msg.?reply-to;
-        unless $reply-to {
-            note "⚠️ No reply-to, ignoring";
-            next;
-        }
+my $consumer = $stream.consumer:
+    'worker-pool',
+    :durable-name<worker-pool>,
+    :filter-subject('worker.task.>'),
+    :ack-policy<explicit>,
+    :max-ack-pending(1),
+    :ack-wait(30),
+    ;
 
-        my %req = try from-json($msg.payload);
-        if $! {
-            $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
-            next;
-        }
+note "📥 Worker {$worker-id} ready to pull from JetStream.";
 
-        my $task = %req<task> // 'Execute a task';
-        my $role = %req<role> // 'worker';
-        note "📨 {$worker-id}: {$role} — {$task.substr(0, 100)}...";
+# ═════════════════════════════════════════════
+# MAIN WORKER LOOP: pull → process → repeat
+# ═════════════════════════════════════════════
 
-        # Process in a start block so react loop stays free
-        start {
-            process-one-task($nats, $task, $role, $worker-id, $reply-to);
-        }
+my $idle-timeout = 300;  # 5 minutes
+my $tasks-done = 0;
+
+loop {
+    note "⏳ Worker {$worker-id}: waiting for task (timeout={$idle-timeout}s)...";
+
+    my $msg-supply = $consumer.next;
+    my $msg = await $msg-supply.Promise;
+
+    # next() returns a message or times out
+    unless $msg && $msg.payload {
+        note "⏰ Worker {$worker-id}: idle timeout, self-terminating after {$tasks-done} tasks.";
+        last;
     }
+
+    # Parse the task
+    my %task = try from-json($msg.payload);
+    if $! {
+        note "⚠️ Invalid JSON, acking and skipping";
+        ack($nats, $msg, $stream, $consumer);
+        next;
+    }
+
+    my $task-text = %task<task> // 'Execute a task';
+    my $role      = %task<role> // 'worker';
+    my $task-id   = %task<id>   // 'unknown';
+    note "📨 Worker {$worker-id}: task {$task-id} — {$task-text.substr(0, 100)}...";
+
+    # Process the task
+    my $result = process-one-task($nats, $task-text, $role, $worker-id);
+
+    # Send result back if reply-to was provided
+    if %task<reply-to> {
+        $nats.publish: %task<reply-to>, to-json({
+            :$worker-id,
+            :$role,
+            :$task-id,
+            :$result,
+        });
+    }
+
+    # Ack the JetStream message
+    ack($nats, $msg, $stream, $consumer);
+    $tasks-done++;
+
+    note "✅ Worker {$worker-id}: task {$task-id} complete ({$tasks-done} total)";
 }
 
-# ── Process a single task (runs in a start block) ──
-sub process-one-task($nats, Str $task, Str $role, Str $worker-id, Str $reply-to) {
+note "💀 Worker {$worker-id} exiting.";
+exit 0;
+
+# ═════════════════════════════════════════════
+# HELPERS
+# ═════════════════════════════════════════════
+
+sub ack($nats, $msg, $stream, $consumer) {
+    $consumer.ack($msg) if $msg;
+}
+
+sub process-one-task($nats, Str $task, Str $role, Str $worker-id --> Str) {
     my @messages = (
         { :role<system>, :content($system ~ "\n\nYour role in this task: {$role}") },
         { :role<user>,   :content($task) },
@@ -174,15 +223,9 @@ sub process-one-task($nats, Str $task, Str $role, Str $worker-id, Str $reply-to)
         last;
     }
 
-    $nats.publish: $reply-to, to-json({
-        :$worker-id,
-        :$role,
-        :result($final-content),
-    });
-    note "  📤 {$worker-id} replied to orchestrator";
+    return $final-content;
 }
 
-# ── Helper: call model ──
 sub call-model($nats, @messages --> Hash) {
     my $inbox = "_INBOX.wkr." ~ (('a'..'z').pick xx 10).join;
     my $sub   = $nats.subscribe: $inbox;
@@ -203,7 +246,6 @@ sub call-model($nats, @messages --> Hash) {
     try from-json($msg.payload) // { :error("JSON parse fail: $!") };
 }
 
-# ── Helper: execute a tool call ──
 sub exec-tool($nats, Str $name, Str $tc-id, %args --> Hash) {
     my $inbox = "_INBOX.tl." ~ (('a'..'z').pick xx 10).join;
     my $sub   = $nats.subscribe: $inbox;

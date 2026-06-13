@@ -1,17 +1,16 @@
 #!/usr/bin/env raku
-# 🌺 Camélia PoC #3 — Orchestrator (Multi-Agent Delegation)
+# 🌺 Camélia PoC #4 — Orchestrator (Worker Pool via JetStream)
 #
-# Long-running service. All communication via NATS.
-# Subscribe: orchestrator.task  → receives prompt
-# Reply:     inbox reply-to     → returns final result
-# Uses react/whenever (same as model-deepseek).
+# Decomposes tasks, publishes to JetStream stream, asks spawner
+# to ensure workers, collects results, synthesizes final response.
 
 use Nats;
 use JSON::Fast;
 
 $*ERR.out-buffer = False;
 
-my $nats-url = %*ENV<NATS_URL> // 'nats://127.0.0.1:4222';
+my $nats-url     = %*ENV<NATS_URL>      // 'nats://127.0.0.1:4222';
+my $max-workers  = %*ENV<MAX_WORKERS>    // 3;
 
 # ── System prompts ──
 
@@ -24,7 +23,7 @@ Each worker can: run shell commands, read files, write files.
 Output ONLY a JSON array of subtask objects:
 [
   {
-    "id": "worker-1",
+    "id": "task-1",
     "role": "brief role description",
     "task": "detailed self-contained instruction for the worker"
   }
@@ -41,9 +40,6 @@ You are a synthesis agent. Given the original request and individual worker resu
 Be concise and direct.
 END
 
-# Real worker IDs (hyphens now supported after grammar fix)
-my @real-workers = <code-reader doc-writer>;
-
 # ── Connect NATS ──
 
 note "🟡 Orchestrator connecting NATS ($nats-url)...";
@@ -54,9 +50,8 @@ $nats.connect;
 my $task-sub = $nats.subscribe: 'orchestrator.task';
 note "🟢 Orchestrator subscribed, entering react...";
 
-# ═════════════════════════════════════════════
-# REACT LOOP (same pattern as model-deepseek)
-# ═════════════════════════════════════════════
+# ── JetStream setup (infrastructure, runs once at startup) ──
+setup-jetstream();
 
 react {
     whenever $task-sub.supply -> $msg {
@@ -81,7 +76,6 @@ react {
 
         note "📨 New task: {$prompt.substr(0, 100)}...";
 
-        # Process in start block so react loop stays free
         start {
             process-task($prompt, $reply-to);
         }
@@ -89,7 +83,45 @@ react {
 }
 
 # ═════════════════════════════════════════════
-# PROCESSING LOGIC (runs inside start blocks)
+# JETSTREAM SETUP
+# ═════════════════════════════════════════════
+
+sub setup-jetstream() {
+    note "📦 Setting up JetStream stream + consumer...";
+
+    my $stream = Nats::Stream.new:
+        :$nats,
+        :name<WORKER_TASKS>,
+        :subjects(['worker.task.>']),
+        :retention<limits>,
+        ;
+
+    my $s-supply = $stream.create;
+    my $s-msg = await $s-supply.Promise;
+    note $s-msg ?? "  ✅ Stream: {$s-msg.payload}" !! "  ⚠️ Stream creation returned no message";
+
+    note "📥 Creating ephemeral pull consumer...";
+    my $consumer-subject = "\$JS.API.CONSUMER.CREATE.WORKER_TASKS.worker-pool";
+    my $consumer-config = to-json({
+        :stream_name<WORKER_TASKS>,
+        :config{
+            :ack_policy<explicit>,
+            :deliver_policy<all>,
+            :filter_subject('worker.task.>'),
+            :max_ack_pending(1),
+            :ack_wait(30_000_000_000),  # 30s in nanoseconds
+            :replay_policy<instant>,
+        },
+    });
+    my $c-resp = $nats.request($consumer-subject, $consumer-config);
+    my $c-msg = await $c-resp.Promise;
+    note $c-msg ?? "  ✅ Consumer created" !! "  ⚠️ Consumer creation returned no message";
+
+    note "✅ JetStream ready.";
+}
+
+# ═════════════════════════════════════════════
+# PROCESSING LOGIC
 # ═════════════════════════════════════════════
 
 sub call-model(@messages, :$temperature = 1.0, :@tools = (), :$tool_choice) {
@@ -110,23 +142,21 @@ sub call-model(@messages, :$temperature = 1.0, :@tools = (), :$tool_choice) {
     try from-json($msg.payload) // { :error("JSON parse fail: $!") };
 }
 
-sub call-worker(Str $id, Str $role, Str $task --> Hash) {
-    my $subject = "worker.{$id}.task";
-    my $inbox   = "_INBOX.orch.{$id}." ~ (('a'..'z').pick xx 8).join;
-    my $sub     = $nats.subscribe: $inbox;
-    my $reply   = start await $sub.supply.head.Promise;
+sub spawn-workers(Int $count --> Hash) {
+    my $inbox = "_INBOX.spawn." ~ (('a'..'z').pick xx 8).join;
+    my $sub   = $nats.subscribe: $inbox;
+    my $reply = start await $sub.supply.head.Promise;
 
-    $nats.publish: $subject, to-json({ :$task, :$role }), :reply-to($inbox);
-    note "  📤 {$id} → {$subject}";
+    $nats.publish: 'spawner.control', to-json({
+        :action<ensure>,
+        :$count,
+    }), :reply-to($inbox);
 
     my $msg = await $reply;
     $nats.unsubscribe: $sub;
 
-    if $msg && $msg.payload {
-        try from-json($msg.payload) // { :error("JSON parse fail in worker reply") }
-    } else {
-        { :error("Worker {$id} no response") }
-    }
+    return { :error("No response from spawner") } unless $msg && $msg.payload;
+    try from-json($msg.payload) // { :error("Spawner JSON parse fail") };
 }
 
 sub process-task(Str $prompt, Str $reply-to) {
@@ -158,36 +188,64 @@ sub process-task(Str $prompt, Str $reply-to) {
         note "  • {$st<id>} ({$st<role>})";
     }
 
-    # Map model-generated worker IDs to actual running workers
-    for @subtasks.kv -> $i, $st {
-        $st<real-id> = @real-workers[$i] // "worker-{$i}";
-    }
+    # ═══════ STEP 2: Publish tasks to JetStream + subscribe to results ═══════
+    note "📤 Publishing {+@subtasks} tasks to worker.task.* stream...";
 
-    # ═══════ STEP 2: Spawn workers in parallel ═══════
-    note "🚀 Spawning {+@subtasks} workers in parallel...";
-    my @promises;
+    my @result-promises;
     for @subtasks -> $st {
-        @promises.push: start {
-            my $result = call-worker($st<real-id>, $st<role>, $st<task>);
-            %( :id($st<real-id>), :role($st<role>), :$result )
+        my $task-id   = $st<id> // ('task-' ~ (^1000).pick);
+        my $result-inbox = "_INBOX.result.{$task-id}." ~ (('a'..'z').pick xx 8).join;
+
+        # Subscribe BEFORE publishing (avoids race)
+        my $result-sub = $nats.subscribe: $result-inbox;
+        my $result-promise = start {
+            my $msg = await $result-sub.supply.head.Promise;
+            $nats.unsubscribe: $result-sub;
+            return { :error("Worker {$task-id}: no response") } unless $msg && $msg.payload;
+            try from-json($msg.payload) // { :error("Bad result JSON") };
         };
+        @result-promises.push: $result-promise;
+
+        # Publish to JetStream subject
+        $nats.publish: "worker.task.{$task-id}", to-json({
+            :id($task-id),
+            :role($st<role>),
+            :task($st<task>),
+            :reply-to($result-inbox),
+        });
+
+        note "  📤 {$task-id} → worker.task.{$task-id}";
     }
 
-    my @results = await @promises;
+    # ═══════ STEP 3: Ensure workers ═══════
+    my $needed = min(+@subtasks, $max-workers.Int);
+    note "🚀 Asking spawner for {$needed} worker(s)...";
+    my %spawn-resp = spawn-workers($needed);
+    if %spawn-resp<ok> {
+        note "  ✅ Spawner: {(%spawn-resp<workers> // []).join(', ')}";
+    } else {
+        note "  ⚠️ Spawner warning: {%spawn-resp<message> // 'unknown'}";
+    }
+
+    # ═══════ STEP 4: Collect results ═══════
+    note "⏳ Waiting for {+@result-promises} worker result(s)...";
+    my @results = await Promise.allof(@result-promises).then({ @result-promises.map(*.result) }).result;
+
     for @results -> $r {
-        if $r<result><error> {
-            note "  ❌ {$r<id>}: {$r<result><error>}";
+        if $r<error> {
+            note "  ❌ {$r<worker-id> // '?'}: {$r<error>}";
         } else {
-            note "  ✅ {$r<id>} done";
+            note "  ✅ {$r<worker-id> // '?'}: {$r<task-id> // '?'} done";
         }
     }
 
-    # ═══════ STEP 3: Synthesize ═══════
+    # ═══════ STEP 5: Synthesize ═══════
     note "🧠 Synthesizing...";
     my $results-block = '';
-    for @results -> $r {
-        $results-block ~= "=== {$r<id>} ({$r<role>}) ===\n";
-        $results-block ~= to-json($r<result>) ~ "\n\n";
+    for @results.kv -> $i, $r {
+        my $label = $r<worker-id> // "worker-{$i}";
+        $results-block ~= "=== {$label} ({$r<role> // '?'}) ===\n";
+        $results-block ~= to-json($r) ~ "\n\n";
     }
 
     my @synth-msgs = (
@@ -202,6 +260,6 @@ sub process-task(Str $prompt, Str $reply-to) {
     }
 
     my $final = %s-resp<choices>[0]<message><content> // '';
-    $nats.publish: $reply-to, to-json({ :result($final), :subtask_count(+@subtasks) });
+    $nats.publish: $reply-to, to-json({ :result($final), :subtask_count(+@subtasks), :mode<jetstream-pool> });
     note "✅ Response sent to caller.";
 }
