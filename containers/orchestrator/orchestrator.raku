@@ -4,6 +4,7 @@
 # Serviço long-running. Toda comunicação via NATS.
 # Subscribe: orchestrator.task  → recebe prompt
 # Reply:     inbox reply-to     → devolve resultado final
+# Uses react/whenever (same as model-deepseek).
 
 use Nats;
 use JSON::Fast;
@@ -40,15 +41,57 @@ You are a synthesis agent. Given the original request and individual worker resu
 Be concise and direct. Respond in Brazilian Portuguese.
 END
 
+# Real worker IDs
+my @real-workers = <code_reader doc_writer>;
+
 # ── Connect NATS ──
 
 note "🟡 Orchestrator conectando NATS ($nats-url)...";
 my $nats = Nats.new: :servers[$nats-url];
 await $nats.start;
 $nats.connect;
-note "🟢 Orchestrator pronto, aguardando tarefas em orchestrator.task...";
 
-# ── Helper: call model (request/response via NATS) ──
+my $task-sub = $nats.subscribe: 'orchestrator.task';
+note "🟢 Orchestrator subscribed, entering react...";
+
+# ═════════════════════════════════════════════
+# REACT LOOP (same pattern as model-deepseek)
+# ═════════════════════════════════════════════
+
+react {
+    whenever $task-sub.supply -> $msg {
+        next unless $msg.payload;
+        my $reply-to = $msg.?reply-to;
+        unless $reply-to {
+            note "⚠️ orchestrator.task sem reply-to, ignorando";
+            next;
+        }
+
+        my %req = try from-json($msg.payload);
+        if $! {
+            $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
+            next;
+        }
+
+        my $prompt = %req<prompt> // '';
+        unless $prompt {
+            $nats.publish: $reply-to, to-json({ :error("Missing 'prompt' field") });
+            next;
+        }
+
+        note "📨 Nova tarefa: {$prompt.substr(0, 100)}...";
+
+        # Process in start block so react loop stays free
+        start {
+            process-task($prompt, $reply-to);
+        }
+    }
+}
+
+# ═════════════════════════════════════════════
+# PROCESSING LOGIC (runs inside start blocks)
+# ═════════════════════════════════════════════
+
 sub call-model(@messages, :$temperature = 1.0, :@tools = (), :$tool_choice) {
     my %body = :model('deepseek-v4-pro'), :@messages, :$temperature;
     %body<tools>      = @tools if @tools;
@@ -67,30 +110,26 @@ sub call-model(@messages, :$temperature = 1.0, :@tools = (), :$tool_choice) {
     try from-json($msg.payload) // { :error("JSON parse fail: $!") };
 }
 
-# ── Helper: spawn worker, wait for reply ──
 sub call-worker(Str $id, Str $role, Str $task --> Hash) {
     my $subject = "worker.{$id}.task";
     my $inbox   = "_INBOX.orch.{$id}." ~ (('a'..'z').pick xx 8).join;
     my $sub     = $nats.subscribe: $inbox;
-    my $promise = start {
-        my $msg = await $sub.supply.head.Promise;
-        $nats.unsubscribe: $sub;
-        if $msg && $msg.payload {
-            try from-json($msg.payload) // { :error("JSON parse fail in worker reply") }
-        } else {
-            { :error("Worker {$id} no response") }
-        }
-    };
+    my $reply   = start await $sub.supply.head.Promise;
 
     $nats.publish: $subject, to-json({ :$task, :$role }), :reply-to($inbox);
     note "  📤 {$id} → {$subject}";
-    return await $promise;
+
+    my $msg = await $reply;
+    $nats.unsubscribe: $sub;
+
+    if $msg && $msg.payload {
+        try from-json($msg.payload) // { :error("JSON parse fail in worker reply") }
+    } else {
+        { :error("Worker {$id} no response") }
+    }
 }
 
-# ── Core: process one orchestrator.task request ──
 sub process-task(Str $prompt, Str $reply-to) {
-    note "📨 Nova tarefa: {$prompt.substr(0, 100)}...";
-
     # ═══════ STEP 1: Decompose ═══════
     note "📋 Decompondo...";
     my @decomp-msgs = (
@@ -119,13 +158,18 @@ sub process-task(Str $prompt, Str $reply-to) {
         note "  • {$st<id>} ({$st<role>})";
     }
 
+    # Map model-generated worker IDs to actual running workers
+    for @subtasks.kv -> $i, $st {
+        $st<real-id> = @real-workers[$i] // "worker-{$i}";
+    }
+
     # ═══════ STEP 2: Spawn workers in parallel ═══════
     note "🚀 Spawnando {+@subtasks} workers em paralelo...";
     my @promises;
     for @subtasks -> $st {
         @promises.push: start {
-            my $result = call-worker($st<id>, $st<role>, $st<task>);
-            %( :id($st<id>), :role($st<role>), :$result )
+            my $result = call-worker($st<real-id>, $st<role>, $st<task>);
+            %( :id($st<real-id>), :role($st<role>), :$result )
         };
     }
 
@@ -160,33 +204,4 @@ sub process-task(Str $prompt, Str $reply-to) {
     my $final = %s-resp<choices>[0]<message><content> // '';
     $nats.publish: $reply-to, to-json({ :result($final), :subtask_count(+@subtasks) });
     note "✅ Resposta enviada ao caller.";
-}
-
-# ── React loop: aguarda tarefas ──
-
-my $task-sub = $nats.subscribe: 'orchestrator.task';
-
-react {
-    whenever $task-sub.supply -> $msg {
-        next unless $msg.payload;
-        my $reply-to = $msg.?reply-to;
-        unless $reply-to {
-            note "⚠️ orchestrator.task sem reply-to, ignorando";
-            next;
-        }
-
-        my %req = try from-json($msg.payload);
-        if $! {
-            $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
-            next;
-        }
-
-        my $prompt = %req<prompt> // '';
-        unless $prompt {
-            $nats.publish: $reply-to, to-json({ :error("Missing 'prompt' field") });
-            next;
-        }
-
-        process-task($prompt, $reply-to);
-    }
 }

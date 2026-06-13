@@ -1,6 +1,6 @@
 # 🌺 Camélia PoC #3 — Multi-Agent Delegation
 # 6 containers: nats, model-deepseek, tool-executor,
-#               worker-code-reader, worker-doc-writer, orchestrator
+#               worker-code_reader, worker-doc_writer, orchestrator
 
 services:
   nats:
@@ -37,7 +37,7 @@ services:
       - NATS_URL=nats://nats:4222
       - SANDBOX_DIR=/tmp/sandbox
 
-  worker-code-reader:
+  worker-code_reader:
     build:
       context: .
       dockerfile: containers/worker/Dockerfile
@@ -51,9 +51,9 @@ services:
         condition: service_started
     environment:
       - NATS_URL=nats://nats:4222
-      - WORKER_ID=code-reader
+      - WORKER_ID=code_reader
 
-  worker-doc-writer:
+  worker-doc_writer:
     build:
       context: .
       dockerfile: containers/worker/Dockerfile
@@ -67,7 +67,7 @@ services:
         condition: service_started
     environment:
       - NATS_URL=nats://nats:4222
-      - WORKER_ID=doc-writer
+      - WORKER_ID=doc_writer
 
   orchestrator:
     build:
@@ -81,9 +81,9 @@ services:
         condition: service_started
       tool-executor:
         condition: service_started
-      worker-code-reader:
+      worker-code_reader:
         condition: service_started
-      worker-doc-writer:
+      worker-doc_writer:
         condition: service_started
     environment:
       - NATS_URL=nats://nats:4222

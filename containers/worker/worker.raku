@@ -3,6 +3,8 @@
 #
 # Subscribes to worker.<WORKER_ID>.task, processes each task
 # through the model+tool loop, returns final result via inbox.
+# Uses react/whenever (same as model-deepseek).
+# Spawns start{} inside whenever to keep react loop free.
 
 use Nats;
 use JSON::Fast;
@@ -13,7 +15,7 @@ my $nats-url  = %*ENV<NATS_URL>  // 'nats://127.0.0.1:4222';
 my $worker-id = %*ENV<WORKER_ID> // 'default';
 my $subject   = "worker.{$worker-id}.task";
 
-# ── Tools schema (same as agent) ──
+# ── Tools schema ──
 my @tools = (
     {
         type     => "function",
@@ -73,64 +75,17 @@ note "🟡 Worker {$worker-id} conectando NATS ($nats-url)...";
 my $nats = Nats.new: :servers[$nats-url];
 await $nats.start;
 $nats.connect;
-note "🟢 Worker {$worker-id} pronto, aguardando tarefas em {$subject}...";
+note "🟢 Worker {$worker-id} conectado.";
 
 my $task-sub = $nats.subscribe: $subject;
+note "🟢 Subscribed {$subject}, entering react...";
 
-# ── Helper: call model ──
-sub call-model(@messages --> Hash) {
-    my $request-id = (^2**32).pick.fmt('%08x');
-    my $request = to-json {
-        :id($request-id),
-        :model('deepseek-v4-pro'),
-        :@messages,
-        :@tools,
-        :tool_choice<auto>,
-    };
-
-    my $inbox = "_INBOX.wkr." ~ (('a'..'z').pick xx 10).join;
-    my $sub   = $nats.subscribe: $inbox;
-    my $reply = start await $sub.supply.head.Promise;
-
-    $nats.publish: 'model.deepseek.completion', $request, :reply-to($inbox);
-
-    my $msg = await $reply;
-    $nats.unsubscribe: $sub;
-
-    return { :error("No response from model") } unless $msg && $msg.payload;
-
-    my %resp = try from-json($msg.payload);
-    return { :error("JSON parse fail: $!") } if $!;
-    return %resp if %resp<error>;
-    return %resp;
-}
-
-# ── Helper: execute a tool call ──
-sub exec-tool(Str $name, Str $tc-id, %args --> Hash) {
-    my $inbox = "_INBOX.tl." ~ (('a'..'z').pick xx 10).join;
-    my $sub   = $nats.subscribe: $inbox;
-    my $reply = start await $sub.supply.head.Promise;
-
-    $nats.publish: "tools.exec.{$name}", to-json({
-        :name($name),
-        :tool_call_id($tc-id),
-        :arguments(%args),
-    }), :reply-to($inbox);
-
-    my $msg = await $reply;
-    $nats.unsubscribe: $sub;
-
-    return { :error("No response from tool executor") } unless $msg && $msg.payload;
-    try from-json($msg.payload) // { :error("JSON parse fail in tool result") };
-}
-
-# ── React loop: process tasks as they arrive ──
 react {
     whenever $task-sub.supply -> $msg {
         next unless $msg.payload;
         my $reply-to = $msg.?reply-to;
         unless $reply-to {
-            note "⚠️ No reply-to in task message, ignorando";
+            note "⚠️ No reply-to, ignorando";
             next;
         }
 
@@ -142,83 +97,128 @@ react {
 
         my $task = %req<task> // 'Execute a task';
         my $role = %req<role> // 'worker';
-        note "📨 {$worker-id} recebeu tarefa: {$role} — {$task.substr(0, 100)}...";
+        note "📨 {$worker-id}: {$role} — {$task.substr(0, 100)}...";
 
-        # Build initial messages
-        my @messages = (
-            { :role<system>, :content($system ~ "\n\nSeu papel nesta tarefa: {$role}") },
-            { :role<user>,   :content($task) },
-        );
+        # Process in a start block so react loop stays free
+        start {
+            process-one-task($nats, $task, $role, $worker-id, $reply-to);
+        }
+    }
+}
 
-        my $final-content = '';
-        my $max-turns = 8;
+# ── Process a single task (runs in a start block) ──
+sub process-one-task($nats, Str $task, Str $role, Str $worker-id, Str $reply-to) {
+    my @messages = (
+        { :role<system>, :content($system ~ "\n\nSeu papel nesta tarefa: {$role}") },
+        { :role<user>,   :content($task) },
+    );
 
-        loop {
-            last if $max-turns-- <= 0;
+    my $final-content = '';
+    my $max-turns = 8;
 
-            my %resp = call-model(@messages);
-            if %resp<error> {
-                note "  ❌ Model error: {%resp<error>}";
-                $final-content = "ERROR: {%resp<error>}";
-                last;
-            }
+    loop {
+        last if $max-turns-- <= 0;
 
-            my $choice  = %resp<choices>[0];
-            unless $choice {
-                note "  ❌ No choices in response";
-                last;
-            }
-
-            my $message = $choice<message> // {};
-            my $finish  = $choice<finish_reason> // '';
-
-            if $message<content> {
-                note "  💬 {$worker-id}: {$message<content>.substr(0, 100)}...";
-                $final-content = $message<content>;
-            }
-
-            if $finish eq 'tool_calls' || $message<tool_calls> {
-                @messages.push: $message;
-
-                my @tcs = $message<tool_calls>.List;
-                note "  🔧 {$worker-id} pediu {+@tcs} tool call(s)";
-
-                for @tcs -> $tc {
-                    my $fn    = $tc<function>;
-                    my $name  = $fn<name>;
-                    my %args  = try from-json($fn<arguments>) // {};
-                    my $tc-id = $tc<id> // 'unknown';
-
-                    note "    ⚙️ {$name}";
-                    my %result = exec-tool($name, $tc-id, %args);
-                    @messages.push: {
-                        :role<tool>,
-                        :tool_call_id($tc-id),
-                        :content(to-json(%result)),
-                    };
-                }
-
-                note "  🔄 Reenviando para o model...";
-                next;
-            }
-
-            if $finish eq 'stop' {
-                @messages.push: $message;
-                note "  ✅ {$worker-id} finalizou tarefa";
-                last;
-            }
-
-            note "  ⚠️ finish_reason={$finish}";
+        my %resp = call-model($nats, @messages);
+        if %resp<error> {
+            note "  ❌ Model error: {%resp<error>}";
+            $final-content = "ERROR: {%resp<error>}";
             last;
         }
 
-        # Return result to orchestrator
-        my $response = to-json({
-            :worker_id($worker-id),
-            :role($role),
-            :result($final-content),
-        });
-        $nats.publish: $reply-to, $response;
-        note "  📤 {$worker-id} respondeu ao orchestrator";
+        my $choice = %resp<choices>[0];
+        unless $choice {
+            note "  ❌ No choices in response";
+            last;
+        }
+
+        my $message = $choice<message> // {};
+        my $finish  = $choice<finish_reason> // '';
+
+        if $message<content> {
+            note "  💬 {$worker-id}: {$message<content>.substr(0, 100)}...";
+            $final-content = $message<content>;
+        }
+
+        if $finish eq 'tool_calls' || $message<tool_calls> {
+            @messages.push: $message;
+
+            my @tcs = $message<tool_calls>.List;
+            note "  🔧 {$worker-id} pediu {+@tcs} tool call(s)";
+
+            for @tcs -> $tc {
+                my $fn    = $tc<function>;
+                my $name  = $fn<name>;
+                my %args  = try from-json($fn<arguments>) // {};
+                my $tc-id = $tc<id> // 'unknown';
+
+                note "    ⚙️ {$name}";
+                my %result = exec-tool($nats, $name, $tc-id, %args);
+                @messages.push: {
+                    :role<tool>,
+                    :tool_call_id($tc-id),
+                    :content(to-json(%result)),
+                };
+            }
+
+            note "  🔄 Reenviando para o model...";
+            next;
+        }
+
+        if $finish eq 'stop' {
+            @messages.push: $message;
+            note "  ✅ {$worker-id} finalizou tarefa";
+            last;
+        }
+
+        note "  ⚠️ finish_reason={$finish}";
+        last;
     }
+
+    $nats.publish: $reply-to, to-json({
+        :$worker-id,
+        :$role,
+        :result($final-content),
+    });
+    note "  📤 {$worker-id} respondeu ao orchestrator";
+}
+
+# ── Helper: call model ──
+sub call-model($nats, @messages --> Hash) {
+    my $inbox = "_INBOX.wkr." ~ (('a'..'z').pick xx 10).join;
+    my $sub   = $nats.subscribe: $inbox;
+    my $reply = start await $sub.supply.head.Promise;
+
+    $nats.publish: 'model.deepseek.completion', to-json({
+        :id((^2**32).pick.fmt('%08x')),
+        :model('deepseek-v4-pro'),
+        :@messages,
+        :@tools,
+        :tool_choice<auto>,
+    }), :reply-to($inbox);
+
+    my $msg = await $reply;
+    $nats.unsubscribe: $sub;
+
+    return { :error("No response from model") } unless $msg && $msg.payload;
+    try from-json($msg.payload) // { :error("JSON parse fail: $!") };
+}
+
+# ── Helper: execute a tool call ──
+sub exec-tool($nats, Str $name, Str $tc-id, %args --> Hash) {
+    my $inbox = "_INBOX.tl." ~ (('a'..'z').pick xx 10).join;
+    my $sub   = $nats.subscribe: $inbox;
+    my $reply = start await $sub.supply.head.Promise;
+
+    $nats.publish: "tools.exec.{$name}", to-json({
+        :$name,
+        :tool_call_id($tc-id),
+        :arguments(%args),
+    }), :reply-to($inbox);
+
+    my $msg = await $reply;
+    $nats.unsubscribe: $sub;
+
+    return { :error("No response from tool executor") } unless $msg && $msg.payload;
+    try from-json($msg.payload) // { :error("JSON parse fail in tool result") };
 }
