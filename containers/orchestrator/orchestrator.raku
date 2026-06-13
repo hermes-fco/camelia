@@ -123,20 +123,6 @@ sub stream(Str $session-id, Str $status, :$message, :$data, :$subtask_count, :$r
 # SESSION STORE HELPERS (remote calls via NATS)
 # ═════════════════════════════════════════════
 
-sub session-call(Str $op, %payload --> Hash) {
-    my $inbox = "_INBOX.ss." ~ (('a'..'z').pick xx 10).join;
-    my $sub   = $nats.subscribe: $inbox;
-    my $reply = start await $sub.supply.head.Promise;
-
-    $nats.publish: "session.store.{$op}", to-json(%payload), :reply-to($inbox);
-
-    my $msg = await $reply;
-    $nats.unsubscribe: $sub;
-
-    return { :error("No response from session-store") } unless $msg && $msg.payload;
-    try from-json($msg.payload) // { :error("Session-store JSON parse fail") };
-}
-
 sub session-load(Str $sid? --> Hash) {
     # If session_id provided, try to load it
     if $sid {
@@ -214,43 +200,45 @@ sub setup-jetstream() {
 }
 
 # ═════════════════════════════════════════════
-# PROCESSING LOGIC
+# REQUEST-REPLY (Promise + tap — avoids $nats.request bugs)
 # ═════════════════════════════════════════════
+
+sub request-reply(Str $subject, Str $payload --> Hash) {
+    my $inbox = "_INBOX.req." ~ (^1_000_000).pick;
+    my $sub = $nats.subscribe: $inbox;
+    my $p = Promise.new;
+    my $t = $sub.supply.tap: -> $msg { try $p.keep($msg) };
+
+    $nats.publish: $subject, $payload, :reply-to($inbox);
+
+    await Promise.anyof: $p, Promise.in(30);
+    $t.close;
+    $nats.unsubscribe: $sub;
+
+    return { :error("No response from {$subject}") } unless $p.so;
+    my $msg = $p.result;
+    return { :error("Empty response") } unless $msg && $msg.payload;
+    try from-json($msg.payload) // { :error("JSON parse fail: $!") };
+}
+
+sub session-call(Str $op, %payload --> Hash) {
+    request-reply("session.store.{$op}", to-json(%payload));
+}
 
 sub call-model(@messages, :$temperature = 1.0, :@tools = (), :$tool_choice) {
     my %body = :model('deepseek-v4-pro'), :@messages, :$temperature;
     %body<tools>      = @tools if @tools;
     %body<tool_choice> = $tool_choice if $tool_choice;
-
-    my $inbox = "_INBOX.orch." ~ (('a'..'z').pick xx 10).join;
-    my $sub   = $nats.subscribe: $inbox;
-    my $reply = start await $sub.supply.head.Promise;
-
-    $nats.publish: 'model.deepseek.completion', to-json(%body), :reply-to($inbox);
-
-    my $msg = await $reply;
-    $nats.unsubscribe: $sub;
-
-    return { :error("No response from model") } unless $msg && $msg.payload;
-    try from-json($msg.payload) // { :error("JSON parse fail: $!") };
+    request-reply('model.deepseek.completion', to-json(%body));
 }
 
 sub spawn-workers(Int $count --> Hash) {
-    my $inbox = "_INBOX.spawn." ~ (('a'..'z').pick xx 8).join;
-    my $sub   = $nats.subscribe: $inbox;
-    my $reply = start await $sub.supply.head.Promise;
-
-    $nats.publish: 'spawner.control', to-json({
-        :action<ensure>,
-        :$count,
-    }), :reply-to($inbox);
-
-    my $msg = await $reply;
-    $nats.unsubscribe: $sub;
-
-    return { :error("No response from spawner") } unless $msg && $msg.payload;
-    try from-json($msg.payload) // { :error("Spawner JSON parse fail") };
+    request-reply('spawner.control', to-json({ :action<ensure>, :$count }));
 }
+
+# ═════════════════════════════════════════════
+# PROCESSING LOGIC
+# ═════════════════════════════════════════════
 
 sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
     # ═══════ SESSION: load from session-store ═══════
@@ -315,9 +303,9 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
         my $task-id   = $st<id> // ('task-' ~ (^1000).pick);
         my $result-inbox = "_INBOX.result.{$task-id}." ~ (('a'..'z').pick xx 8).join;
 
-        my $result-sub = $nats.subscribe: $result-inbox;
+        my $result-sub = $nats.subscribe: $result-inbox, :max-messages(1);
         my $result-promise = start {
-            my $msg = await $result-sub.supply.head.Promise;
+            my $msg = await $result-sub.supply.head(1).Promise;
             $nats.unsubscribe: $result-sub;
             return { :error("Worker {$task-id}: no response") } unless $msg && $msg.payload;
             try from-json($msg.payload) // { :error("Bad result JSON") };
@@ -414,7 +402,7 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
 
     stream($sid, 'done',
         :message("Response ready"),
-        :$result($final),
+        :result($final),
         :subtask_count(+@subtasks),
     );
 

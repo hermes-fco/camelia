@@ -88,7 +88,7 @@ react {
 # DOCKER REST API HELPERS
 # ═════════════════════════════════════════════
 
-sub docker-api(Str $method, Str $path, Str $body? --> Hash) {
+sub docker-api(Str $method, Str $path, Str $body?) {
     my $url = "http://localhost" ~ $path;
     my $cmd = "curl -s --unix-socket {$docker-sock} -X {$method}"
             ~ " -H 'Content-Type: application/json'";
@@ -111,7 +111,7 @@ sub docker-api(Str $method, Str $path, Str $body? --> Hash) {
 }
 
 sub shell-escape(Str $s --> Str) {
-    $s.subst(/\\/, '\\\\', :g).subst(/"/, '\\"', :g)
+    $s.trans(['"', '\\'] => ['\"', '\\\\'])
 }
 
 # ═════════════════════════════════════════════
@@ -213,10 +213,11 @@ sub handle-stop-all(Str $reply-to) {
 
 sub handle-gc() {
     # List ALL containers (including exited)
-    my %list = docker-api('GET', '/containers/json?all=true');
-    return if %list<error>;
+    my $list = docker-api('GET', '/containers/json?all=true');
+    return if $list ~~ Hash && $list<error>;
+    return unless $list ~~ Array;
 
-    my @containers = %list.List;  # JSON array → Raku list
+    my @containers = $list.List;  # JSON array → Raku list
     return unless @containers.elems;
 
     my $now = now.Int;

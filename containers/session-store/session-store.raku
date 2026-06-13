@@ -34,57 +34,59 @@ my $stream = setup-stream();
 note "✅ Stream SESSIONS ready.";
 
 # ── Subscribe to all API subjects ──
-my %subs;
-for <create get append list delete> -> $op {
-    my $subject = "session.store.{$op}";
-    %subs{$op} = $nats.subscribe: $subject;
-    note "🟢 Listening on {$subject}";
-}
-
-# ── Pipe all subscriptions into a channel ──
-my $chan = Channel.new;
-for %subs.kv -> $op, $sub {
-    $sub.supply.tap: -> $msg {
-        next unless $msg.payload;
-        $chan.send: { :$op, :$msg };
-    }
-}
-
-note "🟢 Session Store ready.";
-note "🟢 Listening on health.check.session-store";
+my $create-sub = $nats.subscribe: 'session.store.create';
+my $get-sub    = $nats.subscribe: 'session.store.get';
+my $append-sub = $nats.subscribe: 'session.store.append';
+my $list-sub   = $nats.subscribe: 'session.store.list';
+my $delete-sub = $nats.subscribe: 'session.store.delete';
 my $health-sub = $nats.subscribe: 'health.check.session-store';
 
+note "🟢 Session Store ready (create/get/append/list/delete + health).";
+
+# ── Shared message handler ──
+sub handle-msg(Str $op, $msg, &handler) {
+    return unless $msg.payload;
+    my $reply-to = $msg.?reply-to;
+    unless $reply-to {
+        note "⚠️ session.store.{$op} without reply-to, ignoring";
+        return;
+    }
+    my %req = try from-json($msg.payload);
+    if $! {
+        $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
+        return;
+    }
+    handler($reply-to, %req);
+}
+
 # ═════════════════════════════════════════════
-# MAIN LOOP
+# MAIN LOOP — direct whenever on each supply
 # ═════════════════════════════════════════════
 
 react {
-    whenever $chan -> %entry {
-        my $op  = %entry<op>;
-        my $msg = %entry<msg>;
-        my $reply-to = $msg.?reply-to;
-
-        unless $reply-to {
-            note "⚠️ session.store.{$op} without reply-to, ignoring";
-            next;
-        }
-
-        my %req = try from-json($msg.payload);
-        if $! {
-            $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
-            next;
-        }
-
-        given $op {
-            when 'create' { handle-create($reply-to, %req) }
-            when 'get'    { handle-get($reply-to, %req) }
-            when 'append' { handle-append($reply-to, %req) }
-            when 'list'   { handle-list($reply-to) }
-            when 'delete' { handle-delete($reply-to, %req) }
-        }
+    note "DEBUG: entering react with 6 whenever blocks";
+    whenever $create-sub.supply -> $msg {
+        note "DEBUG: create-supply fired!";
+        handle-msg('create', $msg, &handle-create);
     }
-
+    whenever $get-sub.supply -> $msg {
+        note "DEBUG: get-supply fired!";
+        handle-msg('get', $msg, &handle-get);
+    }
+    whenever $append-sub.supply -> $msg {
+        note "DEBUG: append fired!";
+        handle-msg('append', $msg, &handle-append);
+    }
+    whenever $list-sub.supply -> $msg {
+        note "DEBUG: list fired!";
+        handle-msg('list', $msg, -> $reply-to, %req { handle-list($reply-to) });
+    }
+    whenever $delete-sub.supply -> $msg {
+        note "DEBUG: delete fired!";
+        handle-msg('delete', $msg, &handle-delete);
+    }
     whenever $health-sub.supply -> $msg {
+        note "DEBUG: health fired!";
         if $msg.?reply-to {
             $nats.publish: $msg.reply-to, to-json({ :status<ok>, :service<session-store> });
         }
