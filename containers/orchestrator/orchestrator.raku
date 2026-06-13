@@ -205,14 +205,12 @@ sub setup-jetstream() {
 
 sub request-reply(Str $subject, Str $payload --> Hash) {
     my $inbox = "_INBOX.req." ~ (^1_000_000).pick;
-    my $sub = $nats.subscribe: $inbox;
-    my $p = Promise.new;
-    my $t = $sub.supply.tap: -> $msg { try $p.keep($msg) };
+    my $sub   = $nats.subscribe: $inbox, :1max-messages;
+    my $p     = $sub.supply.head.Promise;
 
     $nats.publish: $subject, $payload, :reply-to($inbox);
 
     await Promise.anyof: $p, Promise.in(30);
-    $t.close;
     $nats.unsubscribe: $sub;
 
     return { :error("No response from {$subject}") } unless $p.so;
@@ -303,9 +301,9 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
         my $task-id   = $st<id> // ('task-' ~ (^1000).pick);
         my $result-inbox = "_INBOX.result.{$task-id}." ~ (('a'..'z').pick xx 8).join;
 
-        my $result-sub = $nats.subscribe: $result-inbox, :max-messages(1);
-        my $result-promise = start {
-            my $msg = await $result-sub.supply.head(1).Promise;
+        my $result-sub = $nats.subscribe: $result-inbox, :1max-messages;
+        my $result-promise = $result-sub.supply.head.Promise.then: -> $p {
+            my $msg = $p.result;
             $nats.unsubscribe: $result-sub;
             return { :error("Worker {$task-id}: no response") } unless $msg && $msg.payload;
             try from-json($msg.payload) // { :error("Bad result JSON") };
@@ -337,8 +335,12 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
     }
 
     # ═══════ STEP 4: Collect results ═══════
-    note "⏳ Waiting for {+@result-promises} worker result(s)...";
-    my @results = await Promise.allof(@result-promises).then({ @result-promises.map(*.result) }).result;
+    note "⏳ Waiting for {+@result-promises} worker result(s) (15s timeout)...";
+    my $all = Promise.allof(@result-promises);
+    await Promise.anyof: $all, Promise.in(15);
+    my @results = $all.so
+        ?? @result-promises.map(*.result)
+        !! [{ :error("Worker result timeout after 15s") }];
 
     my $done-count = 0;
     for @results -> $r {
