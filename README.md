@@ -13,51 +13,55 @@
        │
        │ nats pub orchestrator.task '{"prompt":"...","session_id":"sess-abc"}' --reply inbox
        ▼
-┌─────────────────┐     ┌──────────┐
-│  ORCHESTRATOR   │────▶│  SPAWNER │  subscribe: orchestrator.task
-│  (decomposes +  │     │ (docker  │  spawner.control
-│   synthesizes +  │     │  socket) │
-│   session mgmt)  │     └────┬─────┘
-└───┬─────────────┘          │
-    │                        │ spawn dynamic workers
-    │ worker.task.*          ▼
-    │ (JetStream)  ┌──────────────────┐
-    │              │ WORKER 1..N      │  pull consumer
-    │              │ (ephemeral,      │  JetStream WORKER_TASKS
-    │              │  idle timeout    │
-    │              │  5 min)          │
-    │              └──┬─────┬─────────┘
-    │                 │     │
-    │     progress ───┘     │
-    │     session.<id>.     │
-    │     worker.*.progress │
-    │                       │
-    ▼                       ▼
-┌──────────┐     ┌──────────────┐
-│  MODEL   │     │    TOOL      │
-│ DEEPSEEK │     │  EXECUTOR    │
-│ (API key)│     │  (sandbox)   │
-└──────────┘     └──────────────┘
-     │                  │
-     └────── NATS ──────┘
+┌─────────────────┐     ┌──────────────────┐     ┌──────────┐
+│  ORCHESTRATOR   │────▶│  SESSION-STORE   │     │  SPAWNER │
+│  (decomposes +  │     │  (CRUD + CAS +   │     │ (docker  │
+│   synthesizes +  │     │   TTL 7d, 40    │     │  socket  │
+│   streams)       │     │   entry cap)     │     │  + GC)   │
+└───┬─────────────┘     └────────┬─────────┘     └────┬─────┘
+    │                            │                    │
+    │ worker.task.*              ▼                    │ spawn
+    │ (JetStream)      ┌──────────────────┐           │ dynamic
+    │                  │  JetStream       │           ▼
+    │                  │  SESSIONS stream │  ┌──────────────────┐
+    │                  │  (seq,           │  │ WORKER 1..N      │
+    │                  │   7d TTL)        │  │ (ephemeral,      │
+    │                  └──────────────────┘  │  idle timeout    │
+    │                                        │  5 min)          │
+    │                                        └──┬─────┬─────────┘
+    │                                           │     │
+    │              progress ────────────────────┘     │
+    │              session.<id>.                      │
+    │              worker.*.progress                  │
+    │                                                 │
+    ▼                                                 ▼
+┌──────────┐                               ┌──────────────┐
+│  MODEL   │                               │    TOOL      │
+│ DEEPSEEK │                               │  EXECUTOR    │
+│ (API key)│                               │  (sandbox)   │
+└──────────┘                               └──────────────┘
+     │                                            │
+     └────────────── NATS ────────────────────────┘
 ```
 
 ### Flow
 
 1. Caller subscribes to `session.<id>.stream` and `session.<id>.worker.>.progress`
 2. Caller publishes `orchestrator.task` with `{"prompt": "...", "session_id": "sess-abc"}` + reply-to inbox
-3. **Orchestrator** creates/loads session, injects conversation history into prompts
-4. Orchestrator streams: `received` → `decomposed` → `workers-ready` → `results-collected` → `synthesizing` → `done`
-5. **Workers** stream per-turn progress: `started` → `thinking` → `tool_call` → `finished`
-6. Final response sent to caller's reply-to inbox (includes `session_id` for follow-ups)
-7. Session persisted to **session-store** (JetStream) — survives orchestrator restart
+3. **Orchestrator** calls **session-store** to load/create session, gets history + `seq` number
+4. Orchestrator decomposes task (with history injected), publishes to JetStream
+5. Orchestrator asks **spawner** for workers, spawner creates Docker containers on demand
+6. **Workers** pull tasks, process with model+tool loop, stream per-turn progress
+7. Orchestrator collects results, synthesizes final response
+8. Orchestrator calls session-store to **atomically append** user+assistant to history (CAS with `seq`)
+9. Result delivered to caller's reply-to inbox (includes `session_id` for follow-ups)
 
 ### Containers
 
 | Container | Language | Responsibility | Has access to |
 |-----------|----------|----------------|---------------|
 | **orchestrator** | Raku | Decomposes tasks, calls session-store for history, JetStream admin, synthesizes, streams | NATS only |
-| **session-store** | Raku | Persistent session CRUD (JetStream SESSIONS stream backend) | NATS only |
+| **session-store** | Raku | Persistent session CRUD with CAS (seq), TTL 7d, history cap 40 entries | NATS only |
 | **spawner** | Raku | Manages worker containers via Docker REST API, periodic GC | Docker socket + NATS |
 | **worker** | Raku | Ephemeral pull consumer, processes tasks with tools, streams progress, auto-terminates | NATS only |
 | **model-deepseek** | Raku | Calls DeepSeek API, decides tool calls | API key + NATS |
