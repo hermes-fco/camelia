@@ -51,6 +51,8 @@ for %subs.kv -> $op, $sub {
 }
 
 note "🟢 Session Store ready.";
+note "🟢 Listening on health.check.session-store";
+my $health-sub = $nats.subscribe: 'health.check.session-store';
 
 # ═════════════════════════════════════════════
 # MAIN LOOP
@@ -79,6 +81,12 @@ react {
             when 'append' { handle-append($reply-to, %req) }
             when 'list'   { handle-list($reply-to) }
             when 'delete' { handle-delete($reply-to, %req) }
+        }
+    }
+
+    whenever $health-sub.supply -> $msg {
+        if $msg.?reply-to {
+            $nats.publish: $msg.reply-to, to-json({ :status<ok>, :service<session-store> });
         }
     }
 }

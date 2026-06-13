@@ -30,6 +30,9 @@ note "🟢 Spawner connected.";
 my $sub = $nats.subscribe: 'spawner.control';
 note "🟢 Listening on spawner.control (max_workers=$max-workers)...";
 
+# Health check
+my $health-sub = $nats.subscribe: 'health.check.spawner';
+
 # ── Pipe NATS messages to channel ──
 my $chan = Channel.new;
 $sub.supply.tap: -> $msg {
@@ -72,6 +75,12 @@ react {
     # ═══════ GC: periodic zombie cleanup (every 60s) ═══════
     whenever Supply.interval(60) {
         handle-gc();
+    }
+
+    whenever $health-sub.supply -> $msg {
+        if $msg.?reply-to {
+            $nats.publish: $msg.reply-to, to-json({ :status<ok>, :service<spawner> });
+        }
     }
 }
 

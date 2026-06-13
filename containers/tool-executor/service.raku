@@ -22,6 +22,9 @@ note "🟢 NATS connected.";
 my $sub = $nats.subscribe: 'tools.exec.>';
 note "🟢 Waiting for tool calls on tools.exec.> (sandbox=$sandbox-dir)...";
 
+# Health check
+my $health-sub = $nats.subscribe: 'health.check.tool-executor';
+
 # ── Tools ──
 
 sub run-shell(Str $command, Int :$timeout = 30 --> Hash) {
@@ -126,5 +129,11 @@ react {
         });
 
         $nats.publish: $reply-to, $response;
+    }
+
+    whenever $health-sub.supply -> $msg {
+        if $msg.?reply-to {
+            $nats.publish: $msg.reply-to, to-json({ :status<ok>, :service<tool-executor> });
+        }
     }
 }

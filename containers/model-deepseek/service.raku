@@ -21,6 +21,9 @@ spurt('/tmp/auth_header', $auth);
 my $sub = $nats.subscribe: 'model.deepseek.completion';
 note "🟢 Subscribed, SID={$sub.sid}. Entering react...";
 
+# Health check
+my $health-sub = $nats.subscribe: 'health.check.model-deepseek';
+
 react {
     whenever $sub.supply -> $msg {
         note "📨 MSG RECEIVED! payload={$msg.payload.chars} chars";
@@ -41,21 +44,35 @@ react {
 
         my $body = to-json(%api-body);
         spurt('/tmp/body.json', $body);
-        note "DEBUG: body.json written ({$body.chars} chars)";
 
-        note "DEBUG: calling DeepSeek...";
-        my $resp = shell(:out,
-            "curl -s --connect-timeout 30 --max-time 120 " ~
-            "https://api.deepseek.com/v1/chat/completions " ~
-            "-H @/tmp/auth_header " ~
-            "-H 'Content-Type: application/json' " ~
-            "-d @/tmp/body.json"
-        ).out.slurp(:close);
-        note "DEBUG: API done, len={$resp.chars}";
+        # Retry loop: up to 3 attempts with exponential backoff
+        my $resp = '';
+        my $attempts = 3;
+        for 1 .. $attempts -> $attempt {
+            note "DEBUG: calling DeepSeek (attempt {$attempt}/{$attempts})...";
+            $resp = shell(:out,
+                "curl -s --connect-timeout 30 --max-time 120 " ~
+                "https://api.deepseek.com/v1/chat/completions " ~
+                "-H @/tmp/auth_header " ~
+                "-H 'Content-Type: application/json' " ~
+                "-d @/tmp/body.json"
+            ).out.slurp(:close);
+            note "DEBUG: API done, len={$resp.chars}";
+
+            last if $resp ~~ /^ '{' /;  # valid JSON, stop retrying
+
+            if $attempt < $attempts {
+                my $delay = 2 ** ($attempt - 1);  # 1s, 2s, 4s
+                note "  ⚠️ Non-JSON response, retrying in {$delay}s...";
+                sleep $delay;
+            }
+        }
+
+        unlink('/tmp/body.json') if '/tmp/body.json'.IO.e;
 
         if $resp !~~ /^ '{' / {
-            note "❌ Non-JSON: {$resp.substr(0, 200)}";
-            $nats.publish: $reply-to, to-json({ :error("Bad response") }) if $reply-to;
+            note "❌ Non-JSON after {$attempts} attempts: {$resp.substr(0, 200)}";
+            $nats.publish: $reply-to, to-json({ :error("API failed after {$attempts} retries") }) if $reply-to;
             next;
         }
 
@@ -81,6 +98,12 @@ react {
         if $reply-to {
             $nats.publish: $reply-to, to-json($data);
             note "DEBUG: published reply";
+        }
+    }
+
+    whenever $health-sub.supply -> $msg {
+        if $msg.?reply-to {
+            $nats.publish: $msg.reply-to, to-json({ :status<ok>, :service<model-deepseek> });
         }
     }
 }

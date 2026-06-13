@@ -12,6 +12,8 @@ $*ERR.out-buffer = False;
 
 my $nats-url     = %*ENV<NATS_URL>      // 'nats://127.0.0.1:4222';
 my $max-workers  = %*ENV<MAX_WORKERS>    // 3;
+my $start-time   = now;                  # for uptime metric
+my $tasks-done   = 0;                    # completed task counter
 
 # ── System prompts ──
 
@@ -55,6 +57,9 @@ note "🟢 Orchestrator subscribed, entering react...";
 # ── JetStream setup (infrastructure, runs once at startup) ──
 setup-jetstream();
 
+# Health check + metrics
+my $health-sub = $nats.subscribe: 'health.check.orchestrator';
+
 react {
     whenever $task-sub.supply -> $msg {
         next unless $msg.payload;
@@ -83,6 +88,18 @@ react {
 
         start {
             process-task($prompt, $reply-to, $session-id);
+        }
+    }
+
+    whenever $health-sub.supply -> $msg {
+        if $msg.?reply-to {
+            my $uptime = (now - $start-time).Int;
+            $nats.publish: $msg.reply-to, to-json({
+                :status<ok>,
+                :service<orchestrator>,
+                :$uptime,
+                :tasks_completed($tasks-done),
+            });
         }
     }
 }
@@ -402,4 +419,5 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
     );
 
     note "✅ Response sent to caller (session {$sid}).";
+    $tasks-done++;
 }
