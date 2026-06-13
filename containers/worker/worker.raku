@@ -102,7 +102,7 @@ my $tasks-done = 0;
 loop {
     note "⏳ Worker {$worker-id}: waiting for task (timeout={$idle-timeout}s)...";
 
-    my $msg-supply = $consumer.next;
+    my $msg-supply = $consumer.next(:expires($idle-timeout));
     my $msg = await $msg-supply.Promise;
 
     # next() returns a message or times out
