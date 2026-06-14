@@ -171,6 +171,7 @@ react {
 
         start {
             stop-typing($chat-id);  # Stop the typing indicator loop
+            note "  📤 RESPONSE TEXT: {$text.substr(0, 150)}...";
             send-telegram($chat-id, $text, :parse-mode($parse));
         }
     }

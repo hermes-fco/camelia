@@ -27,6 +27,8 @@ Available worker types:
   • containers_list — list all Camélia containers with state/status
   • container_detail — args: {"name":"camelia-<name>"} — detailed info on one container
   • system_health — overall health summary (running/stopped counts, all containers)
+  • session_get — args: {"session_id":"sess-xxx"} — get session data and history
+  • session_list — list all active session IDs
 
 The system containers are: camelia-nats, camelia-orchestrator, camelia-spawner,
 camelia-worker-model-deepseek, camelia-tool-executor, camelia-session-store,

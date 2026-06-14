@@ -140,14 +140,42 @@ sub handle-system-health(--> Hash) {
     return %result;
 }
 
+# ── Session store bridge ──
+sub session-request(Str $subject, Str $payload --> Hash) {
+    my $supply = $nats.request: $subject, $payload;
+    my $p = $supply.head.Promise;
+    await Promise.anyof: $p, Promise.in(10);
+    if $p.so {
+        my $msg = $p.result;
+        if $msg && $msg.payload {
+            try from-json($msg.payload) // { :error("JSON parse fail: $!") }
+        } else {
+            { :error("Empty response from {$subject}") }
+        }
+    } else {
+        { :error("No response from {$subject}") }
+    }
+}
+
+sub handle-session-get(Str $session-id --> Hash) {
+    return { :error("session_id required") } unless $session-id;
+    session-request('session.store.get', to-json({ :session_id($session-id) }));
+}
+
+sub handle-session-list(--> Hash) {
+    session-request('session.store.list', '{}');
+}
+
 # ── Topic router ──
 sub dispatch(Str $topic, %args --> Hash) {
     given $topic {
         when 'containers_list'   { handle-containers-list() }
         when 'container_detail'  { handle-container-detail(%args<name> // '') }
         when 'system_health'     { handle-system-health() }
+        when 'session_get'       { handle-session-get(%args<session_id> // '') }
+        when 'session_list'      { handle-session-list() }
         default {
-            { :error("Unknown topic: $topic. Available: containers_list, container_detail, system_health") }
+            { :error("Unknown topic: $topic. Available: containers_list, container_detail, system_health, session_get, session_list") }
         }
     }
 }
