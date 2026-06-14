@@ -11,7 +11,8 @@ $*ERR.out-buffer = False;
 my $nats-url   = %*ENV<NATS_URL>   // 'nats://127.0.0.1:4222';
 my $ollama-url = %*ENV<OLLAMA_URL>  // 'http://ollama:11434';
 my $model      = %*ENV<OLLAMA_MODEL> // 'qwen2.5:3b';
-my $subject    = "model.ollama.{$model}.completion";
+my $safe-model = $model.subst(':', '-', :g);
+my $subject    = "model.ollama.{$safe-model}.completion";
 
 note "🟡 Model-Ollama connecting NATS ($nats-url)...";
 my $nats = Nats.new: :servers[$nats-url];

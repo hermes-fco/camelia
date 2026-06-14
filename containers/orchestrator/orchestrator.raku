@@ -14,6 +14,7 @@ my $nats-url     = %*ENV<NATS_URL>      // 'nats://127.0.0.1:4222';
 my $max-workers  = %*ENV<MAX_WORKERS>    // 3;
 my $start-time   = now;                  # for uptime metric
 my $tasks-done   = 0;                    # completed task counter
+my $model-subject = %*ENV<MODEL_SUBJECT> // 'model.deepseek.deepseek-v4-pro.completion';
 
 # ── System prompts ──
 
@@ -236,8 +237,6 @@ sub request-reply(Str $subject, Str $payload --> Hash) {
 sub session-call(Str $op, %payload --> Hash) {
     request-reply("session.store.{$op}", to-json(%payload));
 }
-
-my $model-subject = %*ENV<MODEL_SUBJECT> // 'model.deepseek.deepseek-v4-pro.completion';
 
 sub call-model(@messages, :$temperature = 1.0, :@tools = (), :$tool_choice) {
     my %body = :model('deepseek-v4-pro'), :@messages, :$temperature;
