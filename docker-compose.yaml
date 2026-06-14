@@ -149,6 +149,33 @@ services:
       - NATS_URL=nats://nats:4222
       - SERVICE_NAME=web-browser
 
+  entry-factory:
+    build:
+      context: .
+      dockerfile: containers/entry-factory/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+      model-deepseek:
+        condition: service_started
+    environment:
+      - NATS_URL=nats://nats:4222
+      - MODEL_SUBJECT=model.deepseek.completion
+      - FACTORY_RETRIES=3
+
+  entry-telegram:
+    build:
+      context: .
+      dockerfile: containers/entry-telegram/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      - NATS_URL=nats://nats:4222
+      - ENTRY_NAME=entry.telegram
+
 networks:
   camelia:
     driver: bridge
