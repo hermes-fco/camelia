@@ -49,7 +49,7 @@ my @tools = (
                 type       => "object",
                 properties => {
                     path    => { type => "string", description => "File path (relative to sandbox)" },
-                    content => { type => "string", description => "Content to write" },
+                    :content({ type => "string", description => "Content to write" }),
                 },
                 required => ["path", "content"],
             },
@@ -186,7 +186,7 @@ loop {
             @messages.push: {
                 :role<tool>,
                 :tool_call_id($tc<id>),
-                :content(to-json($result)),
+                :content(to-json $result),
             };
         }
 

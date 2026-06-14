@@ -17,7 +17,7 @@ say "📤 Publishing task (no session_id)...";
 $nats.publish: 'orchestrator.task', $task, :reply-to($inbox);
 
 say "⏳ Waiting (120s)...";
-my @msgs = await $sub.supply.head(1);
+my @msgs = await $sub.supply.head;
 if @msgs && @msgs[0].payload {
     my %r = try from-json(@msgs[0].payload) // {};
     if %r<error> { say "❌ {%r<error>}" }

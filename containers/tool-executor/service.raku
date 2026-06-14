@@ -76,10 +76,10 @@ sub write-file(Str $path, Str $content --> Hash) {
     }
 }
 
-my %tools = (
-    run_shell  => &run-shell,
-    read_file  => &read-file,
-    write_file => &write-file,
+my %tools = %(
+    :run_shell(&run-shell),
+    :read_file(&read-file),
+    :write_file(&write-file),
 );
 
 # ── Main loop via react/whenever ──

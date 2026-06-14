@@ -19,7 +19,7 @@ say "DEBUG JSON: {$json}";
 $nats.publish: 'model.deepseek.completion', $json, :reply-to($inbox);
 
 say "⏳ Waiting (60s)...";
-my @msgs = await $sub.supply.head(1);
+my @msgs = await $sub.supply.head;
 if @msgs && @msgs[0].payload {
     my %r = try from-json(@msgs[0].payload) // {};
     if %r<error> { say "❌ API error: {%r<error>}" }

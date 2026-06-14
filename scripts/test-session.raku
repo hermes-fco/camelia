@@ -14,7 +14,7 @@ my $sub = $nats.subscribe: $inbox, :max-messages(1);
 say "📤 Testing session.store.create...";
 $nats.publish: 'session.store.create', to-json({}), :reply-to($inbox);
 
-my @msgs = await $sub.supply.head(1);
+my @msgs = await $sub.supply.head;
 if @msgs && @msgs[0].payload {
     my %r = try from-json(@msgs[0].payload) // {};
     say "✅ Session store response:";

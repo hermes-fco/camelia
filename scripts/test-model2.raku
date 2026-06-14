@@ -11,9 +11,9 @@ my $inbox = "_INBOX.test-" ~ (^10000).pick;
 my $sub = $nats.subscribe: $inbox, :max-messages(1);
 
 my $body = to-json({
-    model => 'deepseek-v4-pro',
-    messages => [{ :role<user>, :content('Say hello from camelia and nothing else') }],
-    temperature => 0.1,
+    :model<deepseek-v4-pro>,
+    :messages([{ :role<user>, :content('Say hello from camelia and nothing else') }],
+    :temperature(0.1),
 });
 
 say "DEBUG JSON: {$body}";
@@ -21,7 +21,7 @@ say "DEBUG JSON: {$body}";
 $nats.publish: 'model.deepseek.completion', $body, :reply-to($inbox);
 
 say "⏳ Waiting (60s)...";
-my @msgs = await $sub.supply.head(1);
+my @msgs = await $sub.supply.head;
 if @msgs && @msgs[0].payload {
     my %r = try from-json(@msgs[0].payload) // {};
     if %r<error> { say "❌ API error: {%r<error>}" }

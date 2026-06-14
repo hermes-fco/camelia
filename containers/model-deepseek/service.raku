@@ -35,9 +35,9 @@ react {
         my $reply-to   = $msg.?reply-to;
         note "📨 Prompt received (id=$request-id, reply-to={$reply-to // 'NONE'})";
 
-        my %api-body = (
-            model    => $model,
-            messages => %req<messages> // [],
+        my %api-body = %(
+            :$model,
+            :messages(%req<messages> // []),
         );
         %api-body<tools> = %req<tools> if %req<tools>:exists;
         %api-body<tool_choice> = %req<tool_choice> if %req<tool_choice>:exists;
@@ -96,7 +96,7 @@ react {
         note "✅ finish={$finish}, tokens={$usage<total_tokens> // '?'}";
 
         if $reply-to {
-            $nats.publish: $reply-to, to-json($data);
+            $nats.publish: $reply-to, to-json $data;
             note "DEBUG: published reply";
         }
     }

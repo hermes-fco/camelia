@@ -11,8 +11,9 @@ my @services = <model-deepseek tool-executor session-store orchestrator spawner>
 
 for @services -> $svc {
     my $subject = "health.check.{$svc}";
-    my $resp = $nats.request($subject, '{}', :timeout(3));
-    if $resp {
+    my $supply = $nats.request($subject, '{}', :timeout(3));
+    my $resp = await $supply.Promise;
+    if $resp && $resp.payload {
         my %data = try from-json($resp.payload) // {};
         say "✅ {$svc}: {%data<status> // 'ok'}";
     } else {
@@ -20,4 +21,4 @@ for @services -> $svc {
     }
 }
 
-$nats.close;
+$nats.stop;

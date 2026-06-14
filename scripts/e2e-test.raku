@@ -17,7 +17,7 @@ say "📤 Publishing to orchestrator.task...";
 $nats.publish: 'orchestrator.task', $task, :reply-to($inbox);
 
 say "⏳ Waiting for response (120s timeout)...";
-my @msgs = await $sub.supply.head(1);
+my @msgs = await $sub.supply.head;
 if @msgs && @msgs[0].payload {
     my %r = try from-json(@msgs[0].payload) // {};
     if %r<error> { say "❌ {%r<error>}" }
