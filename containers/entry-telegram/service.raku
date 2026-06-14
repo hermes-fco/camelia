@@ -81,11 +81,12 @@ start {
     note "🔁 Starting Telegram poll loop (interval={$poll-interval}s)...";
     loop {
         my $resp = telegram-get('getUpdates',
-            "offset={$offset}&timeout=10&allowed_updates=[\"message\"]");
+            "offset={$offset}&timeout=10");
 
         if $resp && $resp ne '' {
             my $data = try from-json($resp);
             unless $! {
+                note "DEBUG: got response ok={$data<ok>}, results=" ~ ($data<result> ?? $data<result>.elems !! 'none');
                 if $data<ok> && $data<result> -> @updates {
                     for @updates -> $update {
                         $offset = $update<update_id> + 1;
