@@ -104,6 +104,20 @@ react {
         my $tool-call-id = %req<tool_call_id> // 'unknown';
         my %args         = %req<arguments> // {};
 
+        # Extract tool name from subject if not in body
+        # Subject: tools.exec.run_shell → run_shell
+        if $tool-name eq '' && $msg.subject {
+            $tool-name = $msg.subject.subst(/^ 'tools.exec.' /, '');
+        }
+
+        # If no arguments key, use all top-level keys except 'name'/'tool_call_id'
+        if %args.elems == 0 && %req.elems > 0 {
+            %args = %req;
+            %args<name>:delete;
+            %args<tool_call_id>:delete;
+            %args<arguments>:delete;
+        }
+
         note "🔧 Executing {$tool-name} (id={$tool-call-id})";
 
         my $result;
@@ -125,6 +139,7 @@ react {
         my $response = to-json({
             :tool_call_id($tool-call-id),
             :name($tool-name),
+            :ok(!$result<error>),
             :result($result),
         });
 

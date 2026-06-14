@@ -13,8 +13,9 @@ $*ERR.out-buffer = False;
 
 my $nats-url     = %*ENV<NATS_URL>     // 'nats://127.0.0.1:4222';
 my $max-workers  = %*ENV<MAX_WORKERS>   // 5;
-my $worker-image = %*ENV<WORKER_IMAGE>  // 'camelia-worker:latest';
-my $docker-sock  = %*ENV<DOCKER_SOCK>   // '/var/run/docker.sock';
+my $worker-image  = %*ENV<WORKER_IMAGE>   // 'camelia-worker:latest';
+my $docker-sock   = %*ENV<DOCKER_SOCK>    // '/var/run/docker.sock';
+my $model-subject = %*ENV<MODEL_SUBJECT>  // 'model.deepseek.completion';
 
 # ── Worker pool state ──
 my %active-workers;  # container-id → { name }
@@ -154,7 +155,7 @@ sub handle-ensure(Int $desired, Str $reply-to) {
         my $container-config = to-json({
             :Image($worker-image),
             :Hostname($worker-name),
-            :Env(["NATS_URL=nats://camelia-nats:4222"]),
+            :Env(["NATS_URL=nats://camelia-nats:4222", "MODEL_SUBJECT={$model-subject}"]),
             HostConfig => { :NetworkMode<camelia-net> },
         });
 
