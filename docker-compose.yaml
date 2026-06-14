@@ -66,6 +66,7 @@ services:
       - NATS_URL=nats://nats:4222
       - SERVICE_NAME=orchestrator
       - MAX_WORKERS=3
+      - MODEL_SUBJECT=model.deepseek.completion
 
   spawner:
     build:
@@ -175,6 +176,7 @@ services:
     environment:
       - NATS_URL=nats://nats:4222
       - ENTRY_NAME=entry.telegram
+      - ENTRY_TOKEN=${ENTRY_TOKEN}
 
   skill-store:
     build:

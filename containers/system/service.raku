@@ -87,7 +87,7 @@ sub handle-container-detail(Str $name --> Hash) {
     my $cid;
     for $list.List -> $c {
         my @names = ($c<Names> // []).List.map({ S:g/^ '/'// });
-        if @names[0] && @names[0] eq $name {
+        if @names[0] && @names[0].starts-with($name) {
             $cid = $c<Id>;
             last;
         }

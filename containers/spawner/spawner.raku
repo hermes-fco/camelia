@@ -162,7 +162,7 @@ sub handle-ensure(Int $desired, Str $reply-to) {
         my $container-config = to-json({
             :Image($worker-image),
             :Hostname($worker-name),
-            :Env(["NATS_URL=nats://camelia-nats:4222", "MODEL_SUBJECT={$model-subject}"]),
+            :Env(["NATS_URL=nats://nats:4222", "MODEL_SUBJECT={$model-subject}"]),
             HostConfig => { :NetworkMode<camelia-net> },
         });
 
@@ -233,12 +233,12 @@ sub handle-ensure-typed(Str $type, Str $reply-to) {
         for $list.List -> $c {
             my @names = ($c<Names> // []).List;
             for @names -> $n {
-                if $n eq "/{$container-name}" && ($c<State> // '') eq 'running' {
+                if $n.starts-with("/{$container-name}") && ($c<State> // '') eq 'running' {
                     note "  ✅ {$container-name} already running";
                     $nats.publish: $reply-to, to-json({ :ok(True), :container($container-name), :status<already_running> });
                     return;
                 }
-                if $n eq "/{$container-name}" {
+                if $n.starts-with("/{$container-name}") {
                     note "  🔄 {$container-name} exists but state={$c<State> // 'unknown'}, removing...";
                     docker-api('DELETE', "/containers/{$c<Id>}");
                 }
@@ -261,7 +261,7 @@ sub handle-ensure-typed(Str $type, Str $reply-to) {
     # Step 3: Build env vars — include model-specific keys for model types
     note "  🐳 Starting {$container-name}...";
     my @env = (
-        "NATS_URL=nats://camelia-nats:4222",
+        "NATS_URL=nats://nats:4222",
         "SERVICE_NAME=worker-{$type}",
     );
 
