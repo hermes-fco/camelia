@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 COPY lib/Camelia/ /opt/camelia/lib/Camelia/
 
 # Service
-COPY containers/worker-model-deepseek/service.raku /app/service.raku
+COPY containers/worker-model-ollama/service.raku /app/service.raku
 
 ENV RAKULIB=/opt/nats.raku
 
