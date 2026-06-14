@@ -258,16 +258,43 @@ sub handle-ensure-typed(Str $type, Str $reply-to) {
         return;
     }
 
-    # Step 3: Start container
+    # Step 3: Build env vars — include model-specific keys for model types
     note "  🐳 Starting {$container-name}...";
+    my @env = (
+        "NATS_URL=nats://camelia-nats:4222",
+        "SERVICE_NAME=worker-{$type}",
+    );
+
+    # Model types need API keys injected
+    if $type eq 'model.deepseek' {
+        my $api-key = %*ENV<DEEPSEEK_API_KEY> // '';
+        if $api-key {
+            @env.push: "DEEPSEEK_API_KEY={$api-key}";
+            note "  🔑 Injecting DEEPSEEK_API_KEY";
+        }
+        my $model-name = %*ENV<DEEPSEEK_MODEL> // 'deepseek-v4-pro';
+        @env.push: "DEEPSEEK_MODEL={$model-name}";
+    }
+    elsif $type.starts-with('model.ollama') {
+        my $ollama-url = %*ENV<OLLAMA_URL> // 'http://ollama:11434';
+        @env.push: "OLLAMA_URL={$ollama-url}";
+        # Extract model name from type: model.ollama.qwen2.5-3b → qwen2.5:3b
+        my $model-name = $type.subst(/^ 'model.ollama.' /, '').subst('-', ':', :g);
+        @env.push: "OLLAMA_MODEL={$model-name}" if $model-name;
+    }
+
+    my %host-config = :NetworkMode<camelia-net>;
+
+    # System worker needs Docker socket
+    if $type eq 'system' {
+        %host-config<Binds> = ["/var/run/docker.sock:/var/run/docker.sock"];
+    }
+
     my $container-config = to-json({
         :Image($image-name),
         :Hostname($container-name),
-        :Env([
-            "NATS_URL=nats://camelia-nats:4222",
-            "SERVICE_NAME=worker-{$type}",
-        ]),
-        HostConfig => { :NetworkMode<camelia-net> },
+        :Env(@env),
+        HostConfig => %host-config,
     });
 
     my %create = docker-api('POST', '/containers/create?name=' ~ $container-name, $container-config);
@@ -319,7 +346,8 @@ sub handle-gc() {
         my $is-worker = False;
         for @names -> $n {
             if $n.starts-with('/camelia-worker') {
-                $is-worker = True;
+                # Model workers are infrastructure, not disposable task workers
+                $is-worker = True unless $n.starts-with('/camelia-worker-model.');
                 last;
             }
         }

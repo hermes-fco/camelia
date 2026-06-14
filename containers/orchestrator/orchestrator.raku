@@ -14,7 +14,7 @@ my $nats-url     = %*ENV<NATS_URL>      // 'nats://127.0.0.1:4222';
 my $max-workers  = %*ENV<MAX_WORKERS>    // 3;
 my $start-time   = now;                  # for uptime metric
 my $tasks-done   = 0;                    # completed task counter
-my $model-subject = %*ENV<MODEL_SUBJECT> // 'model.deepseek.completion';
+my $model-subject = %*ENV<MODEL_SUBJECT> // 'worker.model.deepseek.completion';
 
 # ── System prompts ──
 
@@ -29,7 +29,7 @@ Available worker types:
   • system_health — overall health summary (running/stopped counts, all containers)
 
 The system containers are: camelia-nats, camelia-orchestrator, camelia-spawner,
-camelia-model-deepseek, camelia-tool-executor, camelia-session-store,
+camelia-worker-model-deepseek, camelia-tool-executor, camelia-session-store,
 camelia-entry-telegram, camelia-worker-shell, camelia-worker-factory,
 camelia-entry-factory, camelia-api-time, camelia-raku-compile, camelia-web-browser,
 camelia-skill-store, camelia-worker-system.
