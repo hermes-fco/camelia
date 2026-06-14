@@ -1,5 +1,5 @@
 FROM camelia-base:latest
 
-COPY worker.raku /app/worker.raku
+COPY containers/worker/worker.raku /app/worker.raku
 
 ENTRYPOINT ["raku", "/app/worker.raku"]

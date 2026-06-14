@@ -89,6 +89,7 @@ sub setup-stream() {
         :max-msgs-per-subject(1),
         :discard<old>,
         :max-age(604800000000000),  # 7 days TTL in nanoseconds
+        :allow-direct,              # enable JetStream direct get API
         ;
 
     my $supply = $stream.create;
@@ -132,7 +133,17 @@ sub handle-get(Str $reply-to, %req) {
 
     my $supply = $stream.get-last-msg("session.data.{$sid}");
     my $p      = $supply.Promise;
-    await Promise.anyof: $p, Promise.in(3);  # timeout: non-existent subject never responds
+    await Promise.anyof: $p, Promise.in(3);
+
+    if $p.so {
+        my $msg = $p.result;
+        note "  🔍 got response: so={$p.so}, msg.defined={$msg.defined}, payload.chars={$msg.payload.chars if $msg}";
+        if $msg && $msg.payload eq '' {
+            note "  🔍 EMPTY payload! Checking raw subject: {$msg.subject}";
+        }
+    } else {
+        note "  🔍 get-last-msg for {$sid}: TIMEOUT";
+    }
 
     unless $p.so && $p.result && $p.result.payload {
         $nats.publish: $reply-to, to-json({ :error("Session not found: {$sid}") });

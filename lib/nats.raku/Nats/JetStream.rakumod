@@ -17,7 +17,7 @@ constant STREAM-PURGE       = JS-API ~ '.STREAM.PURGE.%s';
 
 # Direct Message Subjects
 constant DIRECT-GET         = JS-API ~ '.DIRECT.GET.%s';
-constant DIRECT-GET-LAST    = JS-API ~ '.DIRECT.GET.%s.%s';
+constant DIRECT-GET-LAST    = JS-API ~ '.DIRECT.GET.%s';
 
 # Consumer Subjects
 constant CONSUMER-CREATE   = JS-API ~ '.CONSUMER.CREATE.%s.%s';
@@ -75,6 +75,7 @@ class Nats::Stream {
     has Int() $.num-replicas    = 1;
     has Int() $.duplicate-window;
     has Bool() $.no-ack         = False;
+    has Bool() $.allow-direct   = False;
     has Str() $.template-owner;
     has Str() $.compression     = 'none';
     has UInt() $.first-seq;
@@ -104,7 +105,7 @@ class Nats::Stream {
 
     # Direct get last message for a subject
     method get-last-msg(Str $subject) {
-        $!nats.request: sprintf(DIRECT-GET-LAST, $!name, $subject), to-json { :last_by_subj($subject) }
+        $!nats.request: sprintf(DIRECT-GET-LAST, $!name), to-json { :last_by_subj($subject) }
     }
 
     method consumer(Str $name, |c) {
