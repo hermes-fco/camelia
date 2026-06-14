@@ -73,7 +73,7 @@ method !process-buffer {
                 when Nats::Data {
                     given .type {
                         when "ok"   {                    }
-                        when "err"  { die $cmd.data      }
+                        when "err"  { note "⚠️ NATS -ERR: {$cmd.data}" }
                         when "ping" { self!print: "PONG" }
                         when "pong" {                    }
                         when "info" {

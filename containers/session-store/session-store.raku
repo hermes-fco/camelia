@@ -33,52 +33,38 @@ note "🟢 Session Store connected.";
 my $stream = setup-stream();
 note "✅ Stream SESSIONS ready.";
 
-# ── Subscribe to all API subjects ──
-my $create-sub = $nats.subscribe: 'session.store.create';
-my $get-sub    = $nats.subscribe: 'session.store.get';
-my $append-sub = $nats.subscribe: 'session.store.append';
-my $list-sub   = $nats.subscribe: 'session.store.list';
-my $delete-sub = $nats.subscribe: 'session.store.delete';
+# ── Subscribe: one wildcard + health ──
+my $main-sub   = $nats.subscribe: 'session.store.>';
 my $health-sub = $nats.subscribe: 'health.check.session-store';
 
-note "🟢 Session Store ready (create/get/append/list/delete + health).";
-
-# ── Shared message handler ──
-sub handle-msg(Str $op, $msg, &handler) {
-    return unless $msg.payload;
-    my $reply-to = $msg.?reply-to;
-    unless $reply-to {
-        note "⚠️ session.store.{$op} without reply-to, ignoring";
-        return;
-    }
-    my %req = try from-json($msg.payload);
-    if $! {
-        $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
-        return;
-    }
-    handler($reply-to, %req);
-}
-
 # ═════════════════════════════════════════════
-# MAIN LOOP — direct whenever on each supply
+# MAIN LOOP — react + whenever (preferred pattern)
 # ═════════════════════════════════════════════
 
 react {
-    whenever $create-sub.supply -> $msg {
-        handle-msg('create', $msg, &handle-create);
+    whenever $main-sub.supply -> $msg {
+        next unless $msg.payload;
+        my $reply-to = $msg.?reply-to;
+        unless $reply-to {
+            note "⚠️ No reply-to on {$msg.subject}, ignoring";
+            next;
+        }
+        my %req = try from-json($msg.payload);
+        if $! {
+            $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
+            next;
+        }
+
+        # Dispatch by subject suffix
+        given $msg.subject {
+            when /create$/ { handle-create($reply-to, %req) }
+            when /get$/    { handle-get($reply-to, %req) }
+            when /append$/ { handle-append($reply-to, %req) }
+            when /list$/   { handle-list($reply-to) }
+            when /delete$/ { handle-delete($reply-to, %req) }
+        }
     }
-    whenever $get-sub.supply -> $msg {
-        handle-msg('get', $msg, &handle-get);
-    }
-    whenever $append-sub.supply -> $msg {
-        handle-msg('append', $msg, &handle-append);
-    }
-    whenever $list-sub.supply -> $msg {
-        handle-msg('list', $msg, -> $reply-to, %req { handle-list($reply-to) });
-    }
-    whenever $delete-sub.supply -> $msg {
-        handle-msg('delete', $msg, &handle-delete);
-    }
+
     whenever $health-sub.supply -> $msg {
         if $msg.?reply-to {
             $nats.publish: $msg.reply-to, to-json({ :status<ok>, :service<session-store> });

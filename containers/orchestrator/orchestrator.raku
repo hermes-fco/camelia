@@ -86,9 +86,7 @@ react {
         note "📨 New task: {$prompt.substr(0, 100)}..." ~
             ($session-id ?? " (session: $session-id)" !! "");
 
-        start {
-            process-task($prompt, $reply-to, $session-id);
-        }
+        process-task($prompt, $reply-to, $session-id);
     }
 
     whenever $health-sub.supply -> $msg {
@@ -211,8 +209,6 @@ sub request-reply(Str $subject, Str $payload --> Hash) {
     $nats.publish: $subject, $payload, :reply-to($inbox);
 
     await Promise.anyof: $p, Promise.in(30);
-    $nats.unsubscribe: $sub;
-
     return { :error("No response from {$subject}") } unless $p.so;
     my $msg = $p.result;
     return { :error("Empty response") } unless $msg && $msg.payload;
@@ -304,7 +300,7 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
         my $result-sub = $nats.subscribe: $result-inbox, :1max-messages;
         my $result-promise = $result-sub.supply.head.Promise.then: -> $p {
             my $msg = $p.result;
-            $nats.unsubscribe: $result-sub;
+            try $nats.unsubscribe: $result-sub;
             return { :error("Worker {$task-id}: no response") } unless $msg && $msg.payload;
             try from-json($msg.payload) // { :error("Bad result JSON") };
         };
