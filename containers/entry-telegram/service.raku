@@ -76,11 +76,23 @@ sub emit(Str $subject, %payload) {
     note "📤 {$subject}: " ~ (%payload.keys.grep({$_ ne 'text'}).join(','));
 }
 
-# ── Send typing indicator ──
-sub send-typing(Str $chat-id) {
-    start {
-        telegram-post('sendChatAction', { :chat_id($chat-id), :action<typing> });
-    }
+# ── Send typing indicator (keeps updating every 4s until stopped) ──
+my %typing-active;  # chat_id → Bool
+my %typing-loops;   # chat_id → Promise
+
+sub start-typing(Str $chat-id) {
+    %typing-active{$chat-id} = True;
+    %typing-loops{$chat-id} = start {
+        while %typing-active{$chat-id} {
+            telegram-post('sendChatAction', { :chat_id($chat-id), :action<typing> });
+            sleep 4;
+        }
+    };
+}
+
+sub stop-typing(Str $chat-id) {
+    %typing-active{$chat-id} = False;
+    %typing-loops{$chat-id}:delete;
 }
 
 # ── Long-poll loop ──
@@ -107,10 +119,11 @@ start {
                             my $text = $msg<text> // $msg<caption> // '';
                             next unless $text;
 
-                            # Show typing indicator while processing
-                            send-typing($chat<id>.Str);
-
                             my $cid = $chat<id>.Str;
+
+                            # Start typing indicator (keeps refreshing until response)
+                            start-typing($cid);
+
                             my %payload = :prompt($text), :chat_id($cid),
                                           :user_id($from<id>.Str),
                                           :username($from<username> // ''),
@@ -157,6 +170,7 @@ react {
         }
 
         start {
+            stop-typing($chat-id);  # Stop the typing indicator loop
             send-telegram($chat-id, $text, :parse-mode($parse));
         }
     }
