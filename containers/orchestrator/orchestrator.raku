@@ -198,23 +198,28 @@ sub setup-jetstream() {
 }
 
 # ═════════════════════════════════════════════
-# REQUEST-REPLY (Promise + tap — avoids $nats.request bugs)
+# REQUEST-REPLY — uses $nats.request (native nats.raku)
 # ═════════════════════════════════════════════
 
 sub request-reply(Str $subject, Str $payload --> Hash) {
-    my $inbox = "_INBOX.req." ~ (^1_000_000).pick;
-    my $sub   = $nats.subscribe: $inbox, :1max-messages;
-    my $p     = $sub.supply.head.Promise;
-
-    $nats.publish: $subject, $payload, :reply-to($inbox);
+    my $supply = $nats.request: $subject, $payload;
+    my $p = $supply.head.Promise;
 
     await Promise.anyof: $p, Promise.in(30);
-    return { :error("No response from {$subject}") } unless $p.so;
-    my $msg = $p.result;
-    return { :error("Empty response") } unless $msg && $msg.payload;
-    try from-json($msg.payload) // { :error("JSON parse fail: $!") };
-}
 
+    my %result = do if $p.so {
+        my $msg = $p.result;
+        if $msg && $msg.payload {
+            try from-json($msg.payload) // { :error("JSON parse fail: $!") };
+        } else {
+            { :error("Empty response") };
+        }
+    } else {
+        { :error("No response from {$subject}") };
+    };
+
+    return %result;
+}
 sub session-call(Str $op, %payload --> Hash) {
     request-reply("session.store.{$op}", to-json(%payload));
 }
@@ -300,7 +305,6 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
         my $result-sub = $nats.subscribe: $result-inbox, :1max-messages;
         my $result-promise = $result-sub.supply.head.Promise.then: -> $p {
             my $msg = $p.result;
-            try $nats.unsubscribe: $result-sub;
             return { :error("Worker {$task-id}: no response") } unless $msg && $msg.payload;
             try from-json($msg.payload) // { :error("Bad result JSON") };
         };
