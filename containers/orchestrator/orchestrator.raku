@@ -86,7 +86,11 @@ react {
         note "📨 New task: {$prompt.substr(0, 100)}..." ~
             ($session-id ?? " (session: $session-id)" !! "");
 
-        process-task($prompt, $reply-to, $session-id);
+        # start {} isolates the await-heavy process-task from the react
+        # event loop — other whenever blocks (health) remain responsive
+        start {
+            process-task($prompt, $reply-to, $session-id);
+        }
     }
 
     whenever $health-sub.supply -> $msg {

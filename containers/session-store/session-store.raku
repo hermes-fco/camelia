@@ -55,13 +55,17 @@ react {
             next;
         }
 
-        # Dispatch by subject suffix
-        given $msg.subject {
-            when /create$/ { handle-create($reply-to, %req) }
-            when /get$/    { handle-get($reply-to, %req) }
-            when /append$/ { handle-append($reply-to, %req) }
-            when /list$/   { handle-list($reply-to) }
-            when /delete$/ { handle-delete($reply-to, %req) }
+        # Dispatch by subject suffix in a start {} block —
+        # handlers like get/append/list use await which would block
+        # the react event loop and prevent processing other requests
+        start {
+            given $msg.subject {
+                when /create$/ { handle-create($reply-to, %req) }
+                when /get$/    { handle-get($reply-to, %req) }
+                when /append$/ { handle-append($reply-to, %req) }
+                when /list$/   { handle-list($reply-to) }
+                when /delete$/ { handle-delete($reply-to, %req) }
+            }
         }
     }
 
@@ -127,14 +131,15 @@ sub handle-get(Str $reply-to, %req) {
     }
 
     my $supply = $stream.get-last-msg("session.data.{$sid}");
-    my $resp = await $supply.Promise;
+    my $p      = $supply.Promise;
+    await Promise.anyof: $p, Promise.in(3);  # timeout: non-existent subject never responds
 
-    unless $resp && $resp.payload {
+    unless $p.so && $p.result && $p.result.payload {
         $nats.publish: $reply-to, to-json({ :error("Session not found: {$sid}") });
         return;
     }
 
-    my %session = try from-json($resp.payload);
+    my %session = try from-json($p.result.payload);
     if $! {
         $nats.publish: $reply-to, to-json({ :error("Corrupt session data: $!") });
         return;
@@ -166,14 +171,15 @@ sub handle-append(Str $reply-to, %req) {
 
     # Fetch current session
     my $supply = $stream.get-last-msg("session.data.{$sid}");
-    my $resp = await $supply.Promise;
+    my $p      = $supply.Promise;
+    await Promise.anyof: $p, Promise.in(3);  # timeout: non-existent subject never responds
 
-    unless $resp && $resp.payload {
+    unless $p.so && $p.result && $p.result.payload {
         $nats.publish: $reply-to, to-json({ :error("Session not found: {$sid}") });
         return;
     }
 
-    my %session = try from-json($resp.payload);
+    my %session = try from-json($p.result.payload);
     if $! {
         $nats.publish: $reply-to, to-json({ :error("Corrupt session data: $!") });
         return;
