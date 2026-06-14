@@ -30,6 +30,9 @@ my $health-sub = $nats.subscribe: 'health.check.entry.telegram';
 my $reply-sub = $nats.subscribe: 'entry.telegram.response';
 note "🟢 Listening for replies on entry.telegram.response";
 
+# Track session per chat for conversation continuity
+my %chat-sessions;  # chat_id → session_id
+
 # ── Telegram API helpers (all Proc::Async) ──
 sub telegram-get(Str $method, Str $params = '') {
     my $url = "{$api-base}/{$method}" ~ ($params ?? "?{$params}" !! '');
@@ -107,16 +110,20 @@ start {
                             # Show typing indicator while processing
                             send-typing($chat<id>.Str);
 
+                            my $cid = $chat<id>.Str;
+                            my %payload = :prompt($text), :chat_id($cid),
+                                          :user_id($from<id>.Str),
+                                          :username($from<username> // ''),
+                                          :first_name($from<first_name> // ''),
+                                          :source($entry-name),
+                                          :ts(DateTime.now.Str);
+
+                            # Pass existing session_id for conversation continuity
+                            %payload<session_id> = %chat-sessions{$cid}
+                                if %chat-sessions{$cid}:exists;
+
                             $nats.publish: 'orchestrator.task',
-                                to-json({
-                                    :prompt($text),
-                                    :chat_id($chat<id>.Str),
-                                    :user_id($from<id>.Str),
-                                    :username($from<username> // ''),
-                                    :first_name($from<first_name> // ''),
-                                    :source($entry-name),
-                                    :ts(DateTime.now.Str),
-                                }),
+                                to-json(%payload),
                                 :reply-to('entry.telegram.response');
                         }
                     }
@@ -141,6 +148,12 @@ react {
         unless $chat-id && $text {
             note "⚠️ Reply missing chat_id or text";
             next;
+        }
+
+        # Store session_id for conversation continuity
+        if %resp<session_id> {
+            %chat-sessions{$chat-id} = %resp<session_id>;
+            note "  🔗 Session {$chat-id} → {%resp<session_id>}";
         }
 
         start {
