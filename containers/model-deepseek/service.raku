@@ -1,5 +1,6 @@
 #!/usr/bin/env raku
 # 🌺 Camélia — Model Provider: DeepSeek (Raku)
+# Uses Proc::Async for non-blocking HTTP calls
 
 use Nats;
 use JSON::Fast;
@@ -25,18 +26,39 @@ note "🟢 Subscribed, SID={$sub.sid}. Entering react...";
 my $health-sub = $nats.subscribe: 'health.check.model-deepseek';
 note "🩺 Health sub SID={$health-sub.sid}";
 
+# ── Proc::Async helper: non-blocking DeepSeek API call ──
+
+sub deepseek-api(Str $body --> Str) {
+    my $proc = Proc::Async.new(
+        'curl', '-s',
+        '--connect-timeout', '30',
+        '--max-time', '120',
+        'https://api.deepseek.com/v1/chat/completions',
+        '-H', '@' ~ '/tmp/auth_header',
+        '-H', 'Content-Type: application/json',
+        '-d', $body,
+    );
+    my $output = '';
+    $proc.stdout.lines(:chomp).tap(-> $line { $output ~= $line ~ "\n" });
+    await $proc.start;
+    return $output;
+}
+
+# ── Main loop ──
+
 react {
     whenever $sub.supply -> $msg {
         note "📨 MSG RECEIVED! payload={$msg.payload.chars} chars";
         next unless $msg.payload;
+
         my %req = try from-json($msg.payload);
         if $! { note "❌ JSON parse: $!"; next; }
         my $request-id = %req<id> // 'unknown';
         my $reply-to   = $msg.?reply-to;
         note "📨 Prompt received (id=$request-id, reply-to={$reply-to // 'NONE'})";
 
-        # start {} isolates blocking curl from react event loop
-        # so health checks remain responsive during API calls
+        # start {} so react loop stays responsive for health checks
+        # (Proc::Async inside start is non-blocking I/O)
         start {
             my %api-body = %(
                 :$model,
@@ -46,19 +68,12 @@ react {
             %api-body<tool_choice> = %req<tool_choice> if %req<tool_choice>:exists;
 
             my $body = to-json(%api-body);
-            spurt('/tmp/body.json', $body);
 
             my $resp = '';
             my $attempts = 3;
             for 1 .. $attempts -> $attempt {
                 note "DEBUG: calling DeepSeek (attempt {$attempt}/{$attempts})...";
-                $resp = shell(:out,
-                    "curl -s --connect-timeout 30 --max-time 120 " ~
-                    "https://api.deepseek.com/v1/chat/completions " ~
-                    "-H @/tmp/auth_header " ~
-                    "-H 'Content-Type: application/json' " ~
-                    "-d @/tmp/body.json"
-                ).out.slurp(:close);
+                $resp = deepseek-api($body);
                 note "DEBUG: API done, len={$resp.chars}";
                 last if $resp ~~ /^ '{' /;
                 if $attempt < $attempts {
@@ -67,8 +82,6 @@ react {
                     sleep $delay;
                 }
             }
-
-            unlink('/tmp/body.json') if '/tmp/body.json'.IO.e;
 
             if $resp !~~ /^ '{' / {
                 note "❌ Non-JSON after {$attempts} attempts: {$resp.substr(0, 200)}";
@@ -103,7 +116,6 @@ react {
 
     whenever $health-sub.supply -> $msg {
         my $rt = $msg.?reply-to;
-        note "HEALTH CHECK received, reply-to=" ~ ($rt // "NONE");
         if $rt {
             $nats.publish: $rt, to-json({ :status<ok>, :service<model-deepseek> });
         }

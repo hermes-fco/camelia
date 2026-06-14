@@ -96,14 +96,17 @@ sub docker-api(Str $method, Str $path, Str $body?) {
         spurt $tmpfile, $body;
         END { unlink $tmpfile if $tmpfile.IO.e }
     }
-    my $cmd = "curl -s --unix-socket {$docker-sock} -X {$method}"
-            ~ " -H 'Content-Type: application/json'";
-    $cmd ~= ' -d @' ~ $tmpfile if $tmpfile;
-    $cmd ~= " {$url}";
 
-    my $proc = shell($cmd, :out, :err);
-    my $output = $proc.out.slurp(:close);
-    my $exit   = $proc.exitcode;
+    my @args = ('curl', '-s', '--unix-socket', $docker-sock, '-X', $method,
+                '-H', 'Content-Type: application/json');
+    @args.push: '-d', '@' ~ $tmpfile if $tmpfile;
+    @args.push: $url;
+
+    my $proc = Proc::Async.new(|@args);
+    my $output = '';
+    $proc.stdout.lines(:chomp).tap(-> $line { $output ~= $line ~ "\n" });
+    my $result = await $proc.start;
+    my $exit   = $result.exitcode;
 
     if $exit != 0 {
         note "  ❌ Docker API error (exit={$exit}): {$output.substr(0, 200)}";

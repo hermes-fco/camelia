@@ -28,12 +28,14 @@ my $health-sub = $nats.subscribe: 'health.check.tool-executor';
 # ── Tools ──
 
 sub run-shell(Str $command, Int :$timeout = 30 --> Hash) {
-    my $proc = shell(:out, :err, "cd {$sandbox-dir} && {$command} 2>&1");
-    my $output = $proc.out.slurp: :close;
-    my $exit   = $proc.exitcode;
+    my $proc = Proc::Async.new('bash', '-c', "cd {$sandbox-dir} && {$command} 2>&1");
+    my $output = '';
+    $proc.stdout.lines(:chomp).tap(-> $line { $output ~= $line ~ "\n" });
+    $proc.stderr.lines(:chomp).tap(-> $line { $output ~= $line ~ "\n" });
+    my $result = await $proc.start;
     {
         :stdout($output.substr(0, 5000)),
-        :exit_code($exit),
+        :exit_code($result.exitcode),
     }
 }
 
