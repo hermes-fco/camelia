@@ -113,6 +113,42 @@ services:
       - MODEL_SUBJECT=model.deepseek.completion
       - FACTORY_RETRIES=3
 
+  worker-api-time:
+    build:
+      context: .
+      dockerfile: containers/api.time/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      - NATS_URL=nats://nats:4222
+      - SERVICE_NAME=api-time
+
+  worker-raku-compile:
+    build:
+      context: .
+      dockerfile: containers/raku.compile/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      - NATS_URL=nats://nats:4222
+      - SERVICE_NAME=raku-compile
+
+  worker-web-browser:
+    build:
+      context: .
+      dockerfile: containers/web-browser/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      - NATS_URL=nats://nats:4222
+      - SERVICE_NAME=web-browser
+
 networks:
   camelia:
     driver: bridge
