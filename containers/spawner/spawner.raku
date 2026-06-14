@@ -163,7 +163,7 @@ sub handle-ensure(Int $desired, Str $reply-to) {
             :Image($worker-image),
             :Hostname($worker-name),
             :Env(["NATS_URL=nats://nats:4222", "MODEL_SUBJECT={$model-subject}"]),
-            HostConfig => { :NetworkMode<camelia-net> },
+            HostConfig => { :NetworkMode<camelia_camelia> },
         });
 
         # Step 1: Create container
@@ -283,7 +283,7 @@ sub handle-ensure-typed(Str $type, Str $reply-to) {
         @env.push: "OLLAMA_MODEL={$model-name}" if $model-name;
     }
 
-    my %host-config = :NetworkMode<camelia-net>;
+    my %host-config = :NetworkMode<camelia_camelia>;
 
     # System worker needs Docker socket
     if $type eq 'system' {
