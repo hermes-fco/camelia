@@ -97,15 +97,17 @@ start {
                             my $text = $msg<text> // $msg<caption> // '';
                             next unless $text;
 
-                            emit('entry.telegram.message', {
-                                :chat_id($chat<id>.Str),
-                                :$text,
-                                :user_id($from<id>.Str),
-                                :username($from<username> // ''),
-                                :first_name($from<first_name> // ''),
-                                :message_id($msg<message_id>),
-                                :chat_type($chat<type> // 'private'),
-                            });
+                            $nats.publish: 'orchestrator.task',
+                                to-json({
+                                    :prompt($text),
+                                    :chat_id($chat<id>.Str),
+                                    :user_id($from<id>.Str),
+                                    :username($from<username> // ''),
+                                    :first_name($from<first_name> // ''),
+                                    :source($entry-name),
+                                    :ts(DateTime.now.Str),
+                                }),
+                                :reply-to('entry.telegram.response');
                         }
                     }
                 }
@@ -123,7 +125,7 @@ react {
         if $! { note "⚠️ Bad reply JSON"; next }
 
         my $chat-id = %resp<chat_id> // '';
-        my $text    = %resp<text>    // '';
+        my $text    = %resp<text> // %resp<result> // '';
         my $parse   = %resp<parse_mode> // '';
 
         unless $chat-id && $text {

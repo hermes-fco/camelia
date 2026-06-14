@@ -59,12 +59,21 @@ react {
         my $tc-id  = %task<id>     // 'unknown';
         my %args   = %task<arguments> // {};
 
-        unless $tool {
-            $nats.publish: $reply-to, to-json({ :error("Missing 'tool' field") });
-            next;
+        # Natural language fallback: treat 'task' field as a shell command
+        if $tool {
+            note "🔧 Shell worker: {$tool} ({$tc-id})";
         }
-
-        note "🔧 Shell worker: {$tool} ({$tc-id})";
+        else {
+            my $shell-cmd = %task<task> // '';
+            if $shell-cmd {
+                note "🔧 Shell worker (NL fallback): {$shell-cmd.substr(0, 80)}...";
+                $tool = 'run_shell';
+                %args = :command($shell-cmd);
+            } else {
+                $nats.publish: $reply-to, to-json({ :error("Missing 'tool' or 'task' field") });
+                next;
+            }
+        }
 
         # Execute via tool-executor (async to avoid blocking event loop)
         start {

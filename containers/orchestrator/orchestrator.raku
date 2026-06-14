@@ -19,11 +19,10 @@ my $model-subject = %*ENV<MODEL_SUBJECT> // 'model.deepseek.completion';
 # ── System prompts ──
 
 my $decomp-system = q:to/END/;
-You are a task orchestrator. Your job is to break down complex tasks into parallel subtasks.
+You are a task orchestrator. Break down complex tasks into parallel subtasks.
 
 Available worker types:
-- worker.shell — executes shell commands, reads/writes files
-- worker.factory — creates new worker types from specifications
+- worker.shell — executes a SINGLE bash one-liner. The 'task' field MUST be a valid bash command (not a description). Chain with && or ; for multiple steps.
 
 Given a user request — and optionally conversation history — decompose it into 2-3 INDEPENDENT subtasks that can be executed in parallel by worker agents.
 
@@ -33,14 +32,15 @@ Output ONLY a JSON array of subtask objects:
     "id": "task-1",
     "role": "brief role description",
     "worker_type": "shell",
-    "task": "detailed self-contained instruction for the worker"
+    "task": "echo hello && date"
   }
 ]
 
 Rules:
+- The 'task' field MUST be a runnable bash command — never a natural language instruction
+- Use && to chain commands, ; for independent ones. Keep it under 500 chars
 - Subtasks MUST be independent (no dependencies between them)
-- Each subtask must be self-contained with all needed context
-- Every subtask needs a "worker_type" field: "shell" for commands/files, "factory" for creating new workers
+- Every subtask needs a "worker_type" field: "shell" for commands, "factory" for creating new workers
 - If conversation history is provided, use it to maintain continuity
 - Output ONLY the JSON array, nothing else — no markdown fences, no explanations
 END
@@ -83,6 +83,7 @@ react {
 
         my $prompt     = %req<prompt>     // '';
         my $session-id = %req<session_id> // '';
+        my $chat-id    = %req<chat_id>    // '';
 
         unless $prompt {
             $nats.publish: $reply-to, to-json({ :error("Missing 'prompt' field") });
@@ -95,7 +96,7 @@ react {
         # start {} isolates the await-heavy process-task from the react
         # event loop — other whenever blocks (health) remain responsive
         start {
-            process-task($prompt, $reply-to, $session-id);
+            process-task($prompt, $reply-to, $session-id, $chat-id);
         }
     }
 
@@ -258,11 +259,11 @@ sub spawn-workers(Int $count --> Hash) {
 # PROCESSING LOGIC
 # ═════════════════════════════════════════════
 
-sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
+sub process-task(Str $prompt, Str $reply-to, Str $session-id?, Str $chat-id?) {
     # ═══════ SESSION: load from session-store ═══════
     my %session = session-load($session-id);
     if %session<error> {
-        $nats.publish: $reply-to, to-json({ :error("Session-store unavailable: {%session<error>}") });
+        $nats.publish: $reply-to, to-json({ :error("Session-store unavailable: {%session<error>}"), :chat_id($chat-id) });
         stream($session-id || 'unknown', 'error', :message("Session-store unavailable"));
         return;
     }
@@ -286,7 +287,7 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
     my %d-resp = call-model(@decomp-msgs, :temperature(0.1));
     if %d-resp<error> {
         my $err = "Decomposition failed: {%d-resp<error>}";
-        $nats.publish: $reply-to, to-json({ :error($err) });
+        $nats.publish: $reply-to, to-json({ :error($err), :chat_id($chat-id) });
         stream($sid, 'error', :message($err));
         return;
     }
@@ -298,7 +299,7 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
     my @subtasks = try from-json($raw);
     if $! || @subtasks.elems == 0 {
         my $err = "Failed to parse subtasks: $!";
-        $nats.publish: $reply-to, to-json({ :error($err) });
+        $nats.publish: $reply-to, to-json({ :error($err), :chat_id($chat-id) });
         stream($sid, 'error', :message($err));
         return;
     }
@@ -336,14 +337,14 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
             !! "worker.{$wtype}.task.{$task-id}";
 
         my %payload = :id($task-id), :role($st<role>), :task($st<task>),
-                      :reply-to($result-inbox), :session-id($sid);
+                      :session-id($sid);
 
         # Factory requests need different payload format
         if $wtype eq 'factory' {
             %payload = :prompt($st<task>), :spec({ :name($task-id), :description($st<role>) });
         }
 
-        $nats.publish: $subject, to-json(%payload);
+        $nats.publish: $subject, to-json(%payload), :reply-to($result-inbox);
 
         note "  📤 {$task-id} ({$wtype}) → {$subject}";
     }
@@ -397,9 +398,10 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
             { :role<assistant>, :content($err-msg) },
         ]);
         $nats.publish: $reply-to, to-json({
-            :error($err-msg),
+            :result($err-msg),
             :session_id($sid),
             :subtask_count(+@subtasks),
+            :chat_id($chat-id),
         });
         stream($sid, 'degraded', :message("Graceful degradation: 0/{+@subtasks} workers completed"));
         note "✅ Graceful degradation response sent (session {$sid}).";
@@ -432,7 +434,7 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
     my %s-resp = call-model(@synth-msgs);
     if %s-resp<error> {
         my $err = "Synthesis failed: {%s-resp<error>}";
-        $nats.publish: $reply-to, to-json({ :error($err) });
+        $nats.publish: $reply-to, to-json({ :error($err), :chat_id($chat-id) });
         stream($sid, 'error', :message($err));
         return;
     }
@@ -450,6 +452,7 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
         :result($final),
         :session_id($sid),
         :subtask_count(+@subtasks),
+        :chat_id($chat-id),
         :mode<jetstream-pool>,
     });
 

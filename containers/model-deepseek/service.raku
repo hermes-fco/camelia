@@ -86,30 +86,33 @@ react {
             if $resp !~~ /^ '{' / {
                 note "❌ Non-JSON after {$attempts} attempts: {$resp.substr(0, 200)}";
                 $nats.publish: $reply-to, to-json({ :error("API failed after {$attempts} retries") }) if $reply-to;
-                return;
             }
+            else {
+                my $data = try from-json($resp);
+                if $! {
+                    note "❌ JSON parse: $!";
+                    $nats.publish: $reply-to, to-json({ :error("JSON parse failed") }) if $reply-to;
+                }
+                elsif $data<error> {
+                    note "❌ API error: {$data<error><message>}";
+                    $nats.publish: $reply-to, to-json({ :error($data<error><message>) }) if $reply-to;
+                }
+                else {
+                    my $choice  = $data<choices>[0];
+                    my $content = $choice<message><content> // '';
+                    my $usage   = $data<usage>;
+                    my $finish  = $choice<finish_reason> // '';
+                    my @tool-calls = ($choice<message><tool_calls> // []).List;
 
-            my $data = try from-json($resp);
-            if $! { note "❌ JSON parse: $!"; return; }
-            if $data<error> {
-                note "❌ API error: {$data<error><message>}";
-                $nats.publish: $reply-to, to-json({ :error($data<error><message>) }) if $reply-to;
-                return;
-            }
+                    if @tool-calls { note "🔧 Tool calls: {+@tool-calls}" }
+                    if $content { note "💬 {$content.substr(0, 100)}..." }
+                    note "✅ finish={$finish}, tokens={$usage<total_tokens> // '?'}";
 
-            my $choice  = $data<choices>[0];
-            my $content = $choice<message><content> // '';
-            my $usage   = $data<usage>;
-            my $finish  = $choice<finish_reason> // '';
-            my @tool-calls = ($choice<message><tool_calls> // []).List;
-
-            if @tool-calls { note "🔧 Tool calls: {+@tool-calls}" }
-            if $content { note "💬 {$content.substr(0, 100)}..." }
-            note "✅ finish={$finish}, tokens={$usage<total_tokens> // '?'}";
-
-            if $reply-to {
-                $nats.publish: $reply-to, to-json $data;
-                note "DEBUG: published reply";
+                    if $reply-to {
+                        $nats.publish: $reply-to, to-json $data;
+                        note "DEBUG: published reply";
+                    }
+                }
             }
         }
     }
