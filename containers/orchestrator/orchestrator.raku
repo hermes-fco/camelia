@@ -23,6 +23,15 @@ You are a task orchestrator. Break down complex tasks into parallel subtasks.
 
 Available worker types:
 - worker.shell — executes a SINGLE bash one-liner. The 'task' field MUST be a valid bash command (not a description). Chain with && or ; for multiple steps.
+- worker.system — queries the Camélia system. The 'task' field is a TOPIC NAME (not a shell command). Available topics:
+  • containers_list — list all Camélia containers with state/status
+  • container_detail — args: {"name":"camelia-<name>"} — detailed info on one container
+  • system_health — overall health summary (running/stopped counts, all containers)
+
+The system containers are: camelia-nats, camelia-orchestrator, camelia-spawner,
+camelia-model-deepseek, camelia-tool-executor, camelia-session-store,
+camelia-entry-telegram, camelia-worker-shell, camelia-worker-factory,
+camelia-entry-factory, camelia-api-time, camelia-raku-compile, camelia-web-browser.
 
 Given a user request — and optionally conversation history — decompose it into 2-3 INDEPENDENT subtasks that can be executed in parallel by worker agents.
 
@@ -36,11 +45,16 @@ Output ONLY a JSON array of subtask objects:
   }
 ]
 
+For system queries, use worker_type "system" and the task is the topic name:
+  {"id":"t1","role":"list containers","worker_type":"system","task":"containers_list"}
+  {"id":"t1","role":"check nats","worker_type":"system","task":"container_detail","args":{"name":"camelia-nats"}}
+
 Rules:
-- The 'task' field MUST be a runnable bash command — never a natural language instruction
+- The 'task' field for shell MUST be a runnable bash command — never a natural language instruction
+- The 'task' field for system MUST be one of the listed topics — never a shell command
 - Use && to chain commands, ; for independent ones. Keep it under 500 chars
 - Subtasks MUST be independent (no dependencies between them)
-- Every subtask needs a "worker_type" field: "shell" for commands, "factory" for creating new workers
+- Every subtask needs a "worker_type" field: "shell" for commands, "system" for container queries, "factory" for creating new workers
 - If conversation history is provided, use it to maintain continuity
 - Output ONLY the JSON array, nothing else — no markdown fences, no explanations
 END
@@ -339,6 +353,9 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?, Str $chat-id?) {
         my %payload = :id($task-id), :role($st<role>), :task($st<task>),
                       :session-id($sid);
 
+        # Pass args for system tasks (e.g., container_detail needs name)
+        %payload<args> = $st<args> if $st<args>:exists;
+
         # Factory requests need different payload format
         if $wtype eq 'factory' {
             %payload = :prompt($st<task>), :spec({ :name($task-id), :description($st<role>) });
@@ -445,6 +462,7 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?, Str $chat-id?) {
                 @result-promises.push: $result-promise;
                 my $subject = "worker.{$wtype}.task.{$task-id}";
                 my %payload = :id($task-id), :role($st<role>), :task($st<task>), :session-id($sid);
+                %payload<args> = $st<args> if $st<args>:exists;
                 $nats.publish: $subject, to-json(%payload), :reply-to($result-inbox);
                 note "  🔄 Retry {$task-id} → {$subject}";
             }

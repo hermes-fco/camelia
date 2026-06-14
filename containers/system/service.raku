@@ -1,0 +1,195 @@
+#!/usr/bin/env raku
+# 🌺 Camélia — Worker: System (container awareness)
+#
+# Subscribes to worker.system.task.> — answers predefined topics
+# about the Camélia system: container status, health, uptime.
+# Direct Docker access via socket (not through tool-executor).
+
+use Nats;
+use JSON::Fast;
+
+$*ERR.out-buffer = False;
+
+my $nats-url     = %*ENV<NATS_URL>     // 'nats://127.0.0.1:4222';
+my $service-name = %*ENV<SERVICE_NAME>  // 'worker-system';
+my $docker-sock  = %*ENV<DOCKER_SOCK>   // '/var/run/docker.sock';
+
+# ── Connect NATS ──
+note "🟡 System-Worker connecting NATS ($nats-url)...";
+my $nats = Nats.new: :servers[$nats-url];
+await $nats.start;
+$nats.connect;
+note "🟢 System-Worker connected.";
+
+my $task-sub   = $nats.subscribe: 'worker.system.task.>';
+my $health-sub = $nats.subscribe: 'health.check.worker.system';
+note "🟢 Listening on worker.system.task.>";
+
+# ── Docker query helper (via REST API, like spawner) ──
+sub docker-api(Str $method, Str $path, Str $body?) {
+    my $url = "http://localhost" ~ $path;
+    my $tmpfile = $body ?? "/tmp/docker-sys-{(^10000).pick}.json" !! Nil;
+    if $tmpfile {
+        spurt $tmpfile, $body;
+        END { unlink $tmpfile if $tmpfile.IO.e }
+    }
+    my @args = ('curl', '-s', '--unix-socket', $docker-sock, '-X', $method,
+                '-H', 'Content-Type: application/json');
+    @args.push: '-d', '@' ~ $tmpfile if $tmpfile;
+    @args.push: $url;
+    my $proc = Proc::Async.new(|@args);
+    my $output = '';
+    $proc.stdout.lines(:chomp).tap(-> $line { $output ~= $line ~ "\n" });
+    my $result = await $proc.start;
+    return { :error("Docker API exit={$result.exitcode}") } if $result.exitcode != 0;
+    return { :ok(True) } unless $output.trim;
+    try from-json($output) // { :error("Invalid JSON from Docker API") };
+}
+
+# ── Run shell command ──
+sub run-cmd(Str $cmd --> Hash) {
+    my $proc = Proc::Async.new('sh', '-c', $cmd);
+    my ($out, $err) = ('', '');
+    $proc.stdout.lines(:chomp).tap(-> $l { $out ~= $l ~ "\n" });
+    $proc.stderr.lines(:chomp).tap(-> $l { $err ~= $l ~ "\n" });
+    my $result = await $proc.start;
+    return { :ok($result.exitcode == 0), :stdout($out.trim), :stderr($err.trim), :exit($result.exitcode) };
+}
+
+# ── Predefined topic handlers ──
+sub handle-containers-list(--> Hash) {
+    my $resp = docker-api('GET', '/containers/json?all=true');
+    return { :error($resp<error>) } if $resp<error>;
+
+    my @containers;
+    for $resp.List -> $c {
+        my @names = ($c<Names> // []).List.map({ S:g/^ '/'// });
+        my $name  = @names[0] // $c<Id>.substr(0, 12);
+        # Filter: only camelia containers
+        next unless $name.starts-with('camelia-');
+        @containers.push: {
+            :$name,
+            :state($c<State> // 'unknown'),
+            :status($c<Status> // ''),
+            :image(($c<Image> // '').substr(0, 40)),
+            :created($c<Created> // 0),
+        };
+    }
+
+    return { :ok(True), :containers(@containers), :count(+@containers) };
+}
+
+sub handle-container-detail(Str $name --> Hash) {
+    # Find container by name
+    my $list = docker-api('GET', '/containers/json?all=true');
+    return { :error($list<error>) } if $list<error>;
+
+    my $cid;
+    for $list.List -> $c {
+        my @names = ($c<Names> // []).List.map({ S:g/^ '/'// });
+        if @names[0] && @names[0] eq $name {
+            $cid = $c<Id>;
+            last;
+        }
+    }
+    return { :error("Container '$name' not found") } unless $cid;
+
+    # Get detailed inspect
+    my $inspect = docker-api('GET', "/containers/{$cid}/json");
+    return { :error($inspect<error>) } if $inspect<error>;
+
+    my $state = $inspect<State> // {};
+    my $config = $inspect<Config> // {};
+
+    return {
+        :ok(True),
+        :$name,
+        :id($cid),
+        :state($state<Status> // 'unknown'),
+        :started_at($state<StartedAt> // ''),
+        :image(($config<Image> // '').substr(0, 50)),
+        :env(((($config<Env> // []).List).grep({ not .starts-with('ENTRY_TOKEN='|'DEEPSEEK_API_KEY=') })).join(', ').substr(0, 300)),
+    };
+}
+
+sub handle-system-health(--> Hash) {
+    my %result = :ok(True), :containers([]);
+
+    my $list = docker-api('GET', '/containers/json?all=true');
+    return { :error($list<error>) } if $list<error>;
+
+    my ($running, $stopped, $total) = (0, 0, 0);
+    for $list.List -> $c {
+        my @names = ($c<Names> // []).List.map({ S:g/^ '/'// });
+        my $name = @names[0] // '';
+        next unless $name.starts-with('camelia-');
+        $total++;
+        if ($c<State> // '') eq 'running' { $running++ } else { $stopped++ }
+        %result<containers>.push: {
+            :$name,
+            :state($c<State> // 'unknown'),
+            :status($c<Status> // ''),
+        };
+    }
+
+    %result<total>   = $total;
+    %result<running> = $running;
+    %result<stopped> = $stopped;
+    %result<healthy> = $running == $total && $total > 0;
+
+    return %result;
+}
+
+# ── Topic router ──
+sub dispatch(Str $topic, %args --> Hash) {
+    given $topic {
+        when 'containers_list'   { handle-containers-list() }
+        when 'container_detail'  { handle-container-detail(%args<name> // '') }
+        when 'system_health'     { handle-system-health() }
+        default {
+            { :error("Unknown topic: $topic. Available: containers_list, container_detail, system_health") }
+        }
+    }
+}
+
+# ── React loop ──
+react {
+    whenever $task-sub.supply -> $msg {
+        next unless $msg.payload;
+        my $reply-to = $msg.?reply-to;
+        unless $reply-to {
+            note "⚠️ No reply-to, ignoring";
+            next;
+        }
+
+        my %task = try from-json($msg.payload);
+        if $! {
+            $nats.publish: $reply-to, to-json({ :ok(False), :error("Invalid JSON") });
+            next;
+        }
+
+        my $topic = %task<topic> // %task<task> // '';
+        my %args  = %task<arguments> // %task<args> // {};
+
+        note "🔍 System query: {$topic}";
+        start {
+            my %resp := dispatch($topic, %args);
+            %resp<worker> = $service-name;
+            $nats.publish: $reply-to, to-json(%resp);
+            if %resp<error> {
+                note "  ❌ {$topic}: {%resp<error>}";
+            } else {
+                note "  ✅ {$topic} done";
+            }
+        }
+    }
+
+    whenever $health-sub.supply -> $msg {
+        if $msg.?reply-to {
+            $nats.publish: $msg.reply-to, to-json({
+                :status<ok>, :service<worker-system>,
+                :topics(['containers_list', 'container_detail', 'system_health']),
+            });
+        }
+    }
+}
