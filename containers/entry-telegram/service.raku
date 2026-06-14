@@ -73,6 +73,13 @@ sub emit(Str $subject, %payload) {
     note "📤 {$subject}: " ~ (%payload.keys.grep({$_ ne 'text'}).join(','));
 }
 
+# ── Send typing indicator ──
+sub send-typing(Str $chat-id) {
+    start {
+        telegram-post('sendChatAction', { :chat_id($chat-id), :action<typing> });
+    }
+}
+
 # ── Long-poll loop ──
 my $offset = 0;
 my $poll-supply = Supplier.new;
@@ -96,6 +103,9 @@ start {
                             my $from = $msg<from> // {};
                             my $text = $msg<text> // $msg<caption> // '';
                             next unless $text;
+
+                            # Show typing indicator while processing
+                            send-typing($chat<id>.Str);
 
                             $nats.publish: 'orchestrator.task',
                                 to-json({

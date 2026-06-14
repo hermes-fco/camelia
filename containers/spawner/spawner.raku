@@ -67,6 +67,10 @@ react {
             when 'stop_all' {
                 handle-stop-all($reply-to);
             }
+            when 'ensure_typed' {
+                my $type = %req<type> // '';
+                handle-ensure-typed($type, $reply-to);
+            }
             default {
                 $nats.publish: $reply-to, to-json({ :error("Unknown action: $action") });
             }
@@ -210,6 +214,86 @@ sub handle-stop-all(Str $reply-to) {
         :ok(True),
         :stopped(@stopped),
     });
+}
+
+# ═════════════════════════════════════════════
+# WORKER GC — cleans up zombie/idle containers
+# ═════════════════════════════════════════════
+
+sub handle-ensure-typed(Str $type, Str $reply-to) {
+    my $image-name = "camelia-worker-{$type}:latest";
+    my $container-name = "camelia-worker-{$type}";
+
+    note "🔍 ensure_typed: type={$type} image={$image-name}";
+
+    # Step 1: Check if already running — list all containers, filter by name
+    my $list = docker-api('GET', '/containers/json?all=true');
+    my $already-running = False;
+    if $list ~~ Array {
+        for $list.List -> $c {
+            my @names = ($c<Names> // []).List;
+            for @names -> $n {
+                if $n eq "/{$container-name}" && ($c<State> // '') eq 'running' {
+                    note "  ✅ {$container-name} already running";
+                    $nats.publish: $reply-to, to-json({ :ok(True), :container($container-name), :status<already_running> });
+                    return;
+                }
+                if $n eq "/{$container-name}" {
+                    note "  🔄 {$container-name} exists but state={$c<State> // 'unknown'}, removing...";
+                    docker-api('DELETE', "/containers/{$c<Id>}");
+                }
+            }
+        }
+    }
+
+    # Step 2: Check if image exists
+    my $img-check = docker-api('GET', "/images/{$image-name}/json");
+    if $img-check<error> {
+        note "  ❌ Image {$image-name} not found";
+        $nats.publish: $reply-to, to-json({
+            :ok(False), :error("Image '{$image-name}' not found"),
+            :reason<no_image>, :type($type),
+            :suggestion("Build image or use worker-factory to create this type"),
+        });
+        return;
+    }
+
+    # Step 3: Start container
+    note "  🐳 Starting {$container-name}...";
+    my $container-config = to-json({
+        :Image($image-name),
+        :Hostname($container-name),
+        :Env([
+            "NATS_URL=nats://camelia-nats:4222",
+            "SERVICE_NAME=worker-{$type}",
+        ]),
+        HostConfig => { :NetworkMode<camelia-net> },
+    });
+
+    my %create = docker-api('POST', '/containers/create?name=' ~ $container-name, $container-config);
+    if %create<error> {
+        note "  ❌ Create failed: {%create<error>}";
+        $nats.publish: $reply-to, to-json({ :ok(False), :error("Container create failed: {%create<error>}") });
+        return;
+    }
+    my $cid = %create<Id> // '';
+    unless $cid {
+        note "  ❌ No container ID returned";
+        $nats.publish: $reply-to, to-json({ :ok(False), :error("No container ID") });
+        return;
+    }
+
+    my %start = docker-api('POST', "/containers/{$cid}/start");
+    if %start<error> {
+        note "  ❌ Start failed: {%start<error>}";
+        docker-api('DELETE', "/containers/{$cid}");
+        $nats.publish: $reply-to, to-json({ :ok(False), :error("Container start failed") });
+        return;
+    }
+
+    %active-workers{$cid} = { :name($container-name) };
+    note "  ✅ {$container-name} ({$cid}) started";
+    $nats.publish: $reply-to, to-json({ :ok(True), :container($container-name), :$cid, :status<started> });
 }
 
 # ═════════════════════════════════════════════

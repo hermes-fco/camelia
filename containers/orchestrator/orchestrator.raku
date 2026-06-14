@@ -389,24 +389,98 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?, Str $chat-id?) {
         :message("{$done-count}/{+@results} worker results collected"),
     );
 
-    # ═══════ STEP 5: Handle results ═══════
+    # ═══════ STEP 5: Handle results — retry with spawner if no workers ═══════
     if $done-count == 0 {
-        note "⚠️ No workers completed — graceful degradation";
-        my $err-msg = "Unable to process your request right now — no workers available. Please try again later.";
-        session-append-batch($sid, $seq, [
-            { :role<user>,      :content($prompt) },
-            { :role<assistant>, :content($err-msg) },
-        ]);
-        $nats.publish: $reply-to, to-json({
-            :result($err-msg),
-            :session_id($sid),
-            :subtask_count(+@subtasks),
-            :chat_id($chat-id),
-        });
-        stream($sid, 'degraded', :message("Graceful degradation: 0/{+@subtasks} workers completed"));
-        note "✅ Graceful degradation response sent (session {$sid}).";
-        $tasks-done++;
-        return;
+        note "⚠️ No workers completed — requesting spawner to ensure typed workers...";
+
+        # Collect unique worker types that failed
+        my %failed-types;
+        for @subtasks -> $st {
+            my $wtype = $st<worker_type> // 'shell';
+            %failed-types{$wtype}++;
+        }
+
+        my $spawner-ok = False;
+        for %failed-types.keys -> $wtype {
+            next if $wtype eq 'factory';  # factory is a meta-worker, skip
+            my %sr = request-reply('spawner.control', to-json({ :action<ensure_typed>, :type($wtype) }));
+            if %sr<ok> {
+                note "  ✅ Spawner ensured worker type '{$wtype}': {%sr<status> // 'started'}";
+                $spawner-ok = True;
+            } else {
+                note "  ⚠️ Spawner for '{$wtype}': {%sr<error> // 'unknown error'}";
+                if %sr<reason> eq 'no_image' {
+                    note "  🏭 No image for '{$wtype}' — requesting worker-factory...";
+                    my %fr = request-reply('worker.factory.request', to-json({
+                        :prompt("Create worker type {$wtype} for executing tasks"),
+                        :spec({ :name($wtype), :description("Worker for {$wtype} tasks") }),
+                    }));
+                    if %fr<status> eq 'created' {
+                        note "  ✅ Factory created '{$wtype}' — retrying spawner...";
+                        sleep 2;
+                        my %sr2 = request-reply('spawner.control', to-json({ :action<ensure_typed>, :type($wtype) }));
+                        if %sr2<ok> { $spawner-ok = True }
+                    }
+                }
+            }
+        }
+
+        if $spawner-ok {
+            note "🔄 Spawner started workers — retrying tasks (15s timeout)...";
+            sleep 3;  # Wait for workers to connect to NATS
+
+            # Re-publish tasks (reuse the same result inbox pattern)
+            @result-promises = ();
+            for @subtasks -> $st {
+                my $task-id   = $st<id> // ('task-' ~ (^1000).pick);
+                my $wtype     = $st<worker_type> // 'shell';
+                next if $wtype eq 'factory';
+                my $result-inbox = "_INBOX.retry.{$task-id}." ~ (('a'..'z').pick xx 8).join;
+                my $result-sub = $nats.subscribe: $result-inbox, :1max-messages;
+                my $result-promise = $result-sub.supply.head.Promise.then: -> $p {
+                    my $msg = $p.result;
+                    return { :error("Worker {$task-id}: no response on retry") } unless $msg && $msg.payload;
+                    try from-json($msg.payload) // { :error("Bad result JSON") };
+                };
+                @result-promises.push: $result-promise;
+                my $subject = "worker.{$wtype}.task.{$task-id}";
+                my %payload = :id($task-id), :role($st<role>), :task($st<task>), :session-id($sid);
+                $nats.publish: $subject, to-json(%payload), :reply-to($result-inbox);
+                note "  🔄 Retry {$task-id} → {$subject}";
+            }
+
+            my $retry-all = Promise.allof(@result-promises);
+            await Promise.anyof: $retry-all, Promise.in(15);
+            @results = $retry-all.so
+                ?? @result-promises.map(*.result)
+                !! [{ :error("Worker retry timeout after 15s") },];
+            $done-count = 0;
+            for @results -> $r {
+                $done-count++ unless $r<error>;
+            }
+            note $done-count > 0
+                ?? "  ✅ Retry: {$done-count}/{+@results} workers responded"
+                !! "  ❌ Retry also failed";
+        }
+
+        if $done-count == 0 {
+            note "⚠️ No workers completed after retry — graceful degradation";
+            my $err-msg = "Unable to process your request right now — no workers available. Please try again later.";
+            session-append-batch($sid, $seq, [
+                { :role<user>,      :content($prompt) },
+                { :role<assistant>, :content($err-msg) },
+            ]);
+            $nats.publish: $reply-to, to-json({
+                :result($err-msg),
+                :session_id($sid),
+                :subtask_count(+@subtasks),
+                :chat_id($chat-id),
+            });
+            stream($sid, 'degraded', :message("Graceful degradation: 0/{+@subtasks} workers completed after retry"));
+            note "✅ Graceful degradation response sent (session {$sid}).";
+            $tasks-done++;
+            return;
+        }
     }
 
     # ═══════ STEP 6: Synthesize (with history) ═══════

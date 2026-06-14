@@ -80,7 +80,7 @@ sub session-call(Str $op, %payload --> Hash) {
     try from-json($msg.payload) // { :error("Bad session JSON") };
 }
 
-# ── Save worker to disk ──
+# ── Save worker to disk and build Docker image ──
 sub persist-worker(Str $name, Str $code) {
     my $dir  = "/workers/{$name}".IO;
     $dir.mkdir;
@@ -89,16 +89,28 @@ sub persist-worker(Str $name, Str $code) {
     spurt($dir.add('service.raku'), $code);
     note "  💾 Saved {$dir}/service.raku";
 
-    # Write Dockerfile
+    # Write Dockerfile (relative to build context)
     my $dockerfile = qq:to/END/;
 FROM camelia-base:latest
-COPY containers/{$name}/service.raku /app/service.raku
-COPY templates/ /opt/camelia/templates/
+COPY service.raku /app/service.raku
 ENTRYPOINT ["raku", "/app/service.raku"]
 END
     spurt($dir.add('Dockerfile'), $dockerfile);
     note "  💾 Saved {$dir}/Dockerfile";
 
+    # Build Docker image
+    my $image-name = "camelia-worker-{$name}:latest";
+    note "  🏗️ Building {$image-name}...";
+    my $proc = Proc::Async.new('docker', 'build', '-t', $image-name, $dir.absolute);
+    my ($out, $err) = ('', '');
+    $proc.stdout.lines(:chomp).tap(-> $l { $out ~= $l ~ "\n" });
+    $proc.stderr.lines(:chomp).tap(-> $l { $err ~= $l ~ "\n" });
+    my $result = await $proc.start;
+    if $result.exitcode != 0 {
+        note "  ❌ Build failed: {$err.substr(0, 300)}";
+        return False;
+    }
+    note "  ✅ Image {$image-name} built";
     return True;
 }
 
@@ -219,15 +231,27 @@ sub handle-factory-request(%req, Str $reply-to) {
         return;
     }
 
-    # Persist worker to disk
-    persist-worker($name, $code);
+    # Persist worker to disk and build Docker image
+    my $built = persist-worker($name, $code);
+
+    unless $built {
+        $nats.publish: $reply-to, to-json({
+            :status<code_generated>,
+            :$name,
+            :attempts($attempt),
+            :error("Docker image build failed — code saved to /workers/{$name}/"),
+        });
+        note "  ⚠️ Factory: {$name} code generated but image build failed";
+        return;
+    }
 
     # Final response
     $nats.publish: $reply-to, to-json({
         :status<created>,
         :$name,
+        :image("camelia-worker-{$name}:latest"),
         :attempts($attempt),
-        :message("Worker {$name} created and validated"),
+        :message("Worker {$name} created, validated, and Docker image built"),
     });
 
     note "  ✅ Factory: {$name} created in {$attempt} attempt(s)";
