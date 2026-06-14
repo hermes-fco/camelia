@@ -346,8 +346,7 @@ sub handle-gc() {
         my $is-worker = False;
         for @names -> $n {
             if $n.starts-with('/camelia-worker') {
-                # Model workers are infrastructure, not disposable task workers
-                $is-worker = True unless $n.starts-with('/camelia-worker-model.');
+                $is-worker = True;
                 last;
             }
         }
