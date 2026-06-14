@@ -1,7 +1,6 @@
 #!/usr/bin/env raku
 # 🌺 Camélia — Model Ollama (proxies NATS → Ollama HTTP API)
-# Listens on model.deepseek.completion (same subject as model-deepseek)
-# so orchestrator/workers don't need changes.
+# Listens on model.ollama.<model>.completion (unique per model)
 
 use Nats;
 use JSON::Fast;
@@ -12,6 +11,7 @@ $*ERR.out-buffer = False;
 my $nats-url   = %*ENV<NATS_URL>   // 'nats://127.0.0.1:4222';
 my $ollama-url = %*ENV<OLLAMA_URL>  // 'http://ollama:11434';
 my $model      = %*ENV<OLLAMA_MODEL> // 'qwen2.5:3b';
+my $subject    = "model.ollama.{$model}.completion";
 
 note "🟡 Model-Ollama connecting NATS ($nats-url)...";
 my $nats = Nats.new: :servers[$nats-url];
@@ -19,10 +19,10 @@ await $nats.start;
 $nats.connect;
 note "🟢 NATS connected. Ollama at {$ollama-url}, model={$model}";
 
-my $http = HTTP::Tinyish.new;
+my $http = HTTP::Tinyish.new: :timeout(300);
 
-my $sub = $nats.subscribe: 'model.deepseek.completion';
-note "🟢 Subscribed, SID={$sub.sid}. Entering react...";
+my $sub = $nats.subscribe: $subject;
+note "🟢 Subscribed to {$subject}, SID={$sub.sid}. Entering react...";
 
 react {
     whenever $sub.supply -> $msg {
@@ -50,9 +50,10 @@ react {
         %ollama-body<tool_choice> = %req<tool_choice> if %req<tool_choice>;
 
         note "DEBUG: calling Ollama...";
+        my %headers = :Content-Type<application/json>;
         my $resp = $http.post(
             "{$ollama-url}/v1/chat/completions",
-            :headers({ :Content-Type<application/json> }),
+            :%headers,
             :content(to-json %ollama-body),
         );
 
@@ -76,13 +77,14 @@ react {
         my $finish = $choice<finish_reason> // 'stop';
         my $msg-content = $choice<message> // {};
 
-        my %response = {
-            :choices([{
-                :message($msg-content),
-                :finish_reason($finish),
-            }]),
+        # Build choice as a proper Hash — NOT [{:a, :b}] which splits into Pairs
+        my %choice-hash = :$finish, :$msg-content;
+        my @choices = %choice-hash,;
+
+        my %response = %(
+            :@choices,
             :usage(%ollama-resp<usage> // {}),
-        };
+        );
 
         $nats.publish: $reply-to, to-json(%response);
         note "✅ reply published";

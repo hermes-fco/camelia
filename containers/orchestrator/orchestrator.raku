@@ -126,25 +126,34 @@ sub stream(Str $session-id, Str $status, :$message, :$data, :$subtask_count, :$r
 # ═════════════════════════════════════════════
 
 sub session-load(Str $sid? --> Hash) {
-    # If session_id provided, try to load it
+    # If session_id provided, try to load it — MUST exist
     if $sid {
         my %resp = session-call('get', { :session_id($sid) });
         if %resp<ok> && %resp<session> {
             note "📂 Loaded session {$sid} (seq={%resp<session><seq>}, {+%resp<session><history>} history entries)";
             return %resp<session>;
         }
-        # Session not found or store unreachable — create new
-        note "⚠️ Session {$sid} not found, creating new";
+        # Session not found — retry once (JetStream propagation delay)
+        note "⚠️ Session {$sid} not found on first attempt, retrying...";
+        sleep 0.5;
+        %resp = session-call('get', { :session_id($sid) });
+        if %resp<ok> && %resp<session> {
+            note "📂 Loaded session {$sid} on retry";
+            return %resp<session>;
+        }
+        # Still not found — this is an error, don't silently create new
+        note "❌ Session {$sid} not found after retry";
+        return { :error("Session not found: {$sid}") };
     }
 
-    # Create new session
+    # No session_id — create new session
     my %resp = session-call('create', {});
     if %resp<ok> && %resp<session> {
         note "🆕 New session: {%resp<session_id>}";
         return %resp<session>;
     }
 
-    # Session-store unreachable — fail explicitly (no silent fallback)
+    # Session-store unreachable
     return { :error("Session-store unreachable") };
 }
 
@@ -209,7 +218,7 @@ sub request-reply(Str $subject, Str $payload --> Hash) {
     my $supply = $nats.request: $subject, $payload;
     my $p = $supply.head.Promise;
 
-    await Promise.anyof: $p, Promise.in(30);
+    await Promise.anyof: $p, Promise.in(120);
 
     my %result = do if $p.so {
         my $msg = $p.result;
@@ -228,11 +237,13 @@ sub session-call(Str $op, %payload --> Hash) {
     request-reply("session.store.{$op}", to-json(%payload));
 }
 
+my $model-subject = %*ENV<MODEL_SUBJECT> // 'model.deepseek.deepseek-v4-pro.completion';
+
 sub call-model(@messages, :$temperature = 1.0, :@tools = (), :$tool_choice) {
     my %body = :model('deepseek-v4-pro'), :@messages, :$temperature;
     %body<tools>      = @tools if @tools;
     %body<tool_choice> = $tool_choice if $tool_choice;
-    request-reply('model.deepseek.completion', to-json(%body));
+    request-reply($model-subject, to-json(%body));
 }
 
 sub spawn-workers(Int $count --> Hash) {
@@ -298,8 +309,8 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
         :subtask_count(+@subtasks),
     );
 
-    # ═══════ STEP 2: Publish tasks to JetStream + subscribe to results ═══════
-    note "📤 Publishing {+@subtasks} tasks to worker.task.* stream...";
+    # ═══════ STEP 2: Publish tasks to JetStream (persisted until workers pull) ═══════
+    note "📤 Publishing {+@subtasks} tasks to worker.task.* (JetStream-backed)...";
 
     my @result-promises;
     for @subtasks -> $st {
@@ -314,6 +325,8 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
         };
         @result-promises.push: $result-promise;
 
+        # Publish to JetStream — stream WORKER_TASKS captures worker.task.>
+        # Workers pull from the stream when they come online
         $nats.publish: "worker.task.{$task-id}", to-json({
             :id($task-id),
             :role($st<role>),
@@ -325,7 +338,7 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
         note "  📤 {$task-id} → worker.task.{$task-id}";
     }
 
-    # ═══════ STEP 3: Ensure workers ═══════
+    # ═══════ STEP 3: Spawn workers (they pull from JetStream) ═══════
     my $needed = min(+@subtasks, $max-workers.Int);
     note "🚀 Asking spawner for {$needed} worker(s)...";
     my %spawn-resp = spawn-workers($needed);
@@ -339,12 +352,12 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
     }
 
     # ═══════ STEP 4: Collect results ═══════
-    note "⏳ Waiting for {+@result-promises} worker result(s) (15s timeout)...";
+    note "⏳ Waiting for {+@result-promises} worker result(s) (60s timeout)...";
     my $all = Promise.allof(@result-promises);
-    await Promise.anyof: $all, Promise.in(15);
+    await Promise.anyof: $all, Promise.in(60);
     my @results = $all.so
         ?? @result-promises.map(*.result)
-        !! [{ :error("Worker result timeout after 15s") }];
+        !! [{ :error("Worker result timeout after 60s") },];
 
     my $done-count = 0;
     for @results -> $r {
@@ -387,7 +400,7 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
     for @results.kv -> $i, $r {
         my $label = $r<worker-id> // "worker-{$i}";
         $results-block ~= "=== {$label} ({$r<role> // '?'}) ===\n";
-        $results-block ~= to-json($r) ~ "\n\n";
+        $results-block ~= to-json $r ~ "\n\n";
     }
 
     my @synth-msgs = (

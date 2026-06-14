@@ -48,7 +48,7 @@ if $sid {
 
     sleep 0.5;
     my %app = req('session.store.append', to-json({
-        :session_id($sid), :expected_seq(0), :entries([{ :role<user>, :content<hi> }]) }));
+        :session_id($sid), :expected_seq(0), :entries([{ :role<user>, :content<hi> },]) }));
     ok('append', %app<ok> && %app<seq> == 1, %app<error> // '');
 }
 

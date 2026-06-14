@@ -171,7 +171,7 @@ sub handle-append(Str $reply-to, %req) {
         my $role    = %req<role>    // '';
         my $content = %req<content> // '';
         if $role && $content {
-            @entries = [{ :$role, :$content }];
+            @entries = [{ :$role, :$content },];
         }
     }
 

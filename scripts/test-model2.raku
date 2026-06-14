@@ -12,7 +12,7 @@ my $sub = $nats.subscribe: $inbox, :max-messages(1);
 
 my $body = to-json({
     :model<deepseek-v4-pro>,
-    :messages([{ :role<user>, :content('Say hello from camelia and nothing else') }],
+    :messages([{ :role<user>, :content('Say hello from camelia and nothing else') },],
     :temperature(0.1),
 });
 

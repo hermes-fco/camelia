@@ -97,7 +97,7 @@ if !$sid {
     my %app = req('session.store.append', to-json({
         :session_id($sid),
         :expected_seq(0),
-        :entries([{ :role<user>, :content<hello camelia> }]),
+        :entries([{ :role<user>, :content('hello camelia') },]),
     }), :timeout(5));
     ok('session.append', %app<ok> && %app<seq> == 1,
        %app<error> // "seq={%app<seq>}");
@@ -115,7 +115,7 @@ if !$sid {
     my %conflict = req('session.store.append', to-json({
         :session_id($sid),
         :expected_seq(0),
-        :entries([{ :role<user>, :content<stale> }]),
+        :entries([{ :role<user>, :content<stale> },]),
     }), :timeout(5));
     ok('session.cas-conflict', %conflict<conflict>,
        %conflict<error> // 'expected conflict=True');
@@ -146,7 +146,7 @@ note "\n── 3. Tool Executor ──";
 my %tool1 = req('tools.exec.run_shell', to-json({
     :name<run_shell>,
     :tool_call_id<test-001>,
-    :arguments({ :command<echo hello-from-sandbox> }),
+    :arguments({ :command('echo hello-from-sandbox') }),
 }), :timeout(10));
 
 my $tool-stdout = %tool1<result><stdout> // %tool1<result> // '';
@@ -157,7 +157,7 @@ ok('tools.run_shell', $tool-stdout ~~ /'hello-from-sandbox'/,
 my %tool2 = req('tools.exec.write_file', to-json({
     :name<write_file>,
     :tool_call_id<test-002>,
-    :arguments({ :path<test-integration.txt>, :content<camelia test content> }),
+    :arguments({ :path<test-integration.txt>, :content('camelia test content') }),
 }), :timeout(10));
 ok('tools.write_file', %tool2<result><ok> || %tool2<ok>,
    %tool2<error> // '');
@@ -169,7 +169,7 @@ ok('tools.write_file', %tool2<result><ok> || %tool2<ok>,
 note "\n── 4. Orchestrator ──";
 
 my %task1 = req('orchestrator.task', to-json({
-    :prompt<Count from 1 to 3. Reply with: ONE TWO THREE>,
+    :prompt('Count from 1 to 3. Reply with: ONE TWO THREE'),
 }), :timeout(90));
 
 my $task-result = %task1<result> // %task1<error> // '';
@@ -189,17 +189,17 @@ my $sid2 = %create2<session_id> // '';
 if !$sid2 {
     skip('Orchestrator+Session', 'session create failed');
 } else {
-    sleep 0.5;
+    sleep 1.0;
 
     # Task 1: say something
     my %task-a = req('orchestrator.task', to-json({
-        :prompt<Say hello in Portuguese. Just the word.>,
+        :prompt('Say hello in Portuguese. Just the word.'),
         :session_id($sid2),
-    }), :timeout(90));
+    }), :timeout(300));
     ok('orch.session.task1', %task-a<result> || %task-a<error>,
        %task-a<error> // (%task-a<result> // '').substr(0, 80));
 
-    sleep 0.5;
+    sleep 1.0;
 
     # Verify session persisted the conversation
     my %get-sess = req('session.store.get', to-json({ :session_id($sid2) }), :timeout(5));
