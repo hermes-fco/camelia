@@ -31,7 +31,14 @@ Available worker types:
 The system containers are: camelia-nats, camelia-orchestrator, camelia-spawner,
 camelia-model-deepseek, camelia-tool-executor, camelia-session-store,
 camelia-entry-telegram, camelia-worker-shell, camelia-worker-factory,
-camelia-entry-factory, camelia-api-time, camelia-raku-compile, camelia-web-browser.
+camelia-entry-factory, camelia-api-time, camelia-raku-compile, camelia-web-browser,
+camelia-skill-store, camelia-worker-system.
+
+A Skill Store is available at skill.store.* (NATS request-reply). Query it when
+you need procedural knowledge. Available skills:
+  • nats-troubleshooting — debug NATS streams and connections
+  • docker-container-management — manage Camelia Docker containers
+  • container-health-overview — full system health check procedure
 
 Given a user request — and optionally conversation history — decompose it into 2-3 INDEPENDENT subtasks that can be executed in parallel by worker agents.
 

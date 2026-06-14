@@ -176,6 +176,32 @@ services:
       - NATS_URL=nats://nats:4222
       - ENTRY_NAME=entry.telegram
 
+  skill-store:
+    build:
+      context: .
+      dockerfile: containers/skill-store/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      - NATS_URL=nats://nats:4222
+      - SERVICE_NAME=skill-store
+
+  worker-system:
+    build:
+      context: .
+      dockerfile: containers/system/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      - NATS_URL=nats://nats:4222
+      - SERVICE_NAME=worker-system
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
 networks:
   camelia:
     driver: bridge
