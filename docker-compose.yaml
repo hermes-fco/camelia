@@ -82,6 +82,37 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
 
+  worker-shell:
+    build:
+      context: .
+      dockerfile: containers/worker-shell/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+      tool-executor:
+        condition: service_started
+    environment:
+      - NATS_URL=nats://nats:4222
+      - SERVICE_NAME=worker-shell
+
+  worker-factory:
+    build:
+      context: .
+      dockerfile: containers/worker-factory/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+      model-deepseek:
+        condition: service_started
+      session-store:
+        condition: service_started
+    environment:
+      - NATS_URL=nats://nats:4222
+      - MODEL_SUBJECT=model.deepseek.completion
+      - FACTORY_RETRIES=3
+
 networks:
   camelia:
     driver: bridge

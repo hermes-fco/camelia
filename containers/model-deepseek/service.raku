@@ -16,7 +16,7 @@ await $nats.start;
 $nats.connect;
 note "🟢 NATS connected.";
 
-my $auth = "Authorization: Bearer %*ENV<DEEPSEEK_API_KEY>";
+my $auth = "Authorization: " ~ "Bearer " ~ %*ENV<DEEPSEEK_API_KEY>;
 spurt('/tmp/auth_header', $auth);
 
 my $sub = $nats.subscribe: 'model.deepseek.completion';

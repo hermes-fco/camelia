@@ -14,21 +14,25 @@ my $nats-url     = %*ENV<NATS_URL>      // 'nats://127.0.0.1:4222';
 my $max-workers  = %*ENV<MAX_WORKERS>    // 3;
 my $start-time   = now;                  # for uptime metric
 my $tasks-done   = 0;                    # completed task counter
-my $model-subject = %*ENV<MODEL_SUBJECT> // 'model.deepseek.deepseek-v4-pro.completion';
+my $model-subject = %*ENV<MODEL_SUBJECT> // 'model.deepseek.completion';
 
 # ── System prompts ──
 
 my $decomp-system = q:to/END/;
 You are a task orchestrator. Your job is to break down complex tasks into parallel subtasks.
 
+Available worker types:
+- worker.shell — executes shell commands, reads/writes files
+- worker.factory — creates new worker types from specifications
+
 Given a user request — and optionally conversation history — decompose it into 2-3 INDEPENDENT subtasks that can be executed in parallel by worker agents.
-Each worker can: run shell commands, read files, write files.
 
 Output ONLY a JSON array of subtask objects:
 [
   {
     "id": "task-1",
     "role": "brief role description",
+    "worker_type": "shell",
     "task": "detailed self-contained instruction for the worker"
   }
 ]
@@ -36,6 +40,7 @@ Output ONLY a JSON array of subtask objects:
 Rules:
 - Subtasks MUST be independent (no dependencies between them)
 - Each subtask must be self-contained with all needed context
+- Every subtask needs a "worker_type" field: "shell" for commands/files, "factory" for creating new workers
 - If conversation history is provided, use it to maintain continuity
 - Output ONLY the JSON array, nothing else — no markdown fences, no explanations
 END
@@ -308,12 +313,13 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
         :subtask_count(+@subtasks),
     );
 
-    # ═══════ STEP 2: Publish tasks to JetStream (persisted until workers pull) ═══════
-    note "📤 Publishing {+@subtasks} tasks to worker.task.* (JetStream-backed)...";
+    # ═══════ STEP 2: Publish tasks to typed workers (direct NATS request-reply) ═══════
+    note "📤 Publishing {+@subtasks} tasks to typed workers...";
 
     my @result-promises;
     for @subtasks -> $st {
         my $task-id   = $st<id> // ('task-' ~ (^1000).pick);
+        my $wtype     = $st<worker_type> // 'shell';
         my $result-inbox = "_INBOX.result.{$task-id}." ~ (('a'..'z').pick xx 8).join;
 
         my $result-sub = $nats.subscribe: $result-inbox, :1max-messages;
@@ -324,30 +330,40 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?) {
         };
         @result-promises.push: $result-promise;
 
-        # Publish to JetStream — stream WORKER_TASKS captures worker.task.>
-        # Workers pull from the stream when they come online
-        $nats.publish: "worker.task.{$task-id}", to-json({
-            :id($task-id),
-            :role($st<role>),
-            :task($st<task>),
-            :reply-to($result-inbox),
-            :session-id($sid),
-        });
+        # Route to typed worker: worker.shell.task.<id>, worker.factory.request, etc.
+        my $subject = $wtype eq 'factory'
+            ?? 'worker.factory.request'
+            !! "worker.{$wtype}.task.{$task-id}";
 
-        note "  📤 {$task-id} → worker.task.{$task-id}";
+        my %payload = :id($task-id), :role($st<role>), :task($st<task>),
+                      :reply-to($result-inbox), :session-id($sid);
+
+        # Factory requests need different payload format
+        if $wtype eq 'factory' {
+            %payload = :prompt($st<task>), :spec({ :name($task-id), :description($st<role>) });
+        }
+
+        $nats.publish: $subject, to-json(%payload);
+
+        note "  📤 {$task-id} ({$wtype}) → {$subject}";
     }
 
-    # ═══════ STEP 3: Spawn workers (they pull from JetStream) ═══════
-    my $needed = min(+@subtasks, $max-workers.Int);
-    note "🚀 Asking spawner for {$needed} worker(s)...";
-    my %spawn-resp = spawn-workers($needed);
-    if %spawn-resp<ok> {
-        note "  ✅ Spawner: {(%spawn-resp<workers> // []).join(', ')}";
-        stream($sid, 'workers-ready',
-            :message("{%spawn-resp<workers>.elems} worker(s) started"),
-        );
+    # ═══════ STEP 3: Spawn workers for non-typed tasks only (JetStream) ═══════
+    my $generic-tasks = @subtasks.grep({ !($_<worker_type> // '') }).elems;
+    if $generic-tasks > 0 {
+        my $needed = min($generic-tasks, $max-workers.Int);
+        note "🚀 Asking spawner for {$needed} generic worker(s)...";
+        my %spawn-resp = spawn-workers($needed);
+        if %spawn-resp<ok> {
+            note "  ✅ Spawner: {(%spawn-resp<workers> // []).join(', ')}";
+            stream($sid, 'workers-ready',
+                :message("{%spawn-resp<workers>.elems} worker(s) started"),
+            );
+        } else {
+            note "  ⚠️ Spawner warning: {%spawn-resp<message> // 'unknown'}";
+        }
     } else {
-        note "  ⚠️ Spawner warning: {%spawn-resp<message> // 'unknown'}";
+        note "✅ All tasks routed to typed workers (no spawner needed)";
     }
 
     # ═══════ STEP 4: Collect results ═══════

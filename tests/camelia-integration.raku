@@ -163,10 +163,60 @@ ok('tools.write_file', %tool2<result><ok> || %tool2<ok>,
    %tool2<error> // '');
 
 # ═══════════════════════════════════════════
-# 4. ORCHESTRATOR — end-to-end task
+# 4. TYPED WORKERS — shell + factory
 # ═══════════════════════════════════════════
 
-note "\n── 4. Orchestrator ──";
+note "\n── 4. Typed Workers ──";
+
+# 4a. Health checks for typed workers
+for <shell factory> -> $wtype {
+    my %hw = req("health.check.worker.{$wtype}", '{}', :timeout(5));
+    ok("health.worker.{$wtype}", %hw<status> eq 'ok', %hw<error> // 'no response');
+}
+
+# 4b. worker.shell — direct task execution
+my %wt1 = req('worker.shell.task.shell-test-1', to-json({
+    :id<shell-test-1>,
+    :tool<run_shell>,
+    :arguments({ :command('echo worker-shell-test-ok') }),
+}), :timeout(15));
+my $wshell-out = %wt1<result><stdout> // %wt1<output> // '';
+ok('worker.shell.direct-task',
+   $wshell-out ~~ /'worker-shell-test-ok'/,
+   %wt1<error> // "output=" ~ $wshell-out.substr(0, 80));
+
+sleep 0.5;
+
+# 4c. worker.shell — write_file via typed worker
+my %wt2 = req('worker.shell.task.shell-test-2', to-json({
+    :id<shell-test-2>,
+    :tool<write_file>,
+    :arguments({ :path<shell-worker-test.txt>, :content('typed-worker-test') }),
+}), :timeout(15));
+ok('worker.shell.write-file',
+   %wt2<ok> || %wt2<result><ok>,
+   %wt2<error> // '');
+
+sleep 0.5;
+
+# 4d. worker.factory — request a new worker type
+my %wf1 = req('worker.factory.request', to-json({
+    :prompt('Create a simple echo worker that responds with the message it receives. Name: test-echo. Subscribe to: test.echo.>.'),
+    :spec({
+        :name<test-echo>,
+        :description('Echo worker for testing'),
+        :subscriptions(['test.echo.>']),
+    }),
+}), :timeout(120));
+ok('worker.factory.create',
+   %wf1<status> eq 'created' || %wf1<status> eq 'validated',
+   %wf1<error> // "status=" ~ (%wf1<status> // 'no-response'));
+
+# ═══════════════════════════════════════════
+# 5. ORCHESTRATOR — end-to-end task
+# ═══════════════════════════════════════════
+
+note "\n── 5. Orchestrator ──";
 
 my %task1 = req('orchestrator.task', to-json({
     :prompt('Count from 1 to 3. Reply with: ONE TWO THREE'),
@@ -181,7 +231,7 @@ ok('orchestrator.simple-task',
 # 5. ORCHESTRATOR with Session (conversation continuity)
 # ═══════════════════════════════════════════
 
-note "\n── 5. Orchestrator with Session ──";
+note "\n── 6. Orchestrator with Session ──";
 
 my %create2 = req('session.store.create', to-json({}), :timeout(5));
 my $sid2 = %create2<session_id> // '';
