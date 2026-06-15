@@ -166,6 +166,93 @@ sub handle-session-list(--> Hash) {
     session-request('session.store.list', '{}');
 }
 
+# ── Reconfigure (env vars + restart) ──
+sub handle-reconfigure(Str $container, %env --> Hash) {
+    return { :error("container name required") } unless $container;
+
+    # 1. Find container by name prefix
+    my $list = docker-api('GET', '/containers/json?all=true');
+    return { :error($list<error>) } if $list<error>;
+
+    my ($cid, $existing-name);
+    for $list.List -> $c {
+        my @names = ($c<Names> // []).List.map({ S:g/^ '/'// });
+        if @names[0] && @names[0].starts-with($container) {
+            $cid = @names[0];
+            $existing-name = @names[0];
+            last;
+        }
+    }
+    return { :error("Container '$container' not found") } unless $cid;
+
+    # 2. Inspect current config
+    my $inspect = docker-api('GET', "/containers/{$cid}/json");
+    return { :error($inspect<error>) } if $inspect<error>;
+
+    my $config = $inspect<Config> // {};
+    my $host-config = $inspect<HostConfig> // {};
+    my $state = $inspect<State> // {};
+
+    # 3. Extract current env vars (as list of "KEY=VALUE")
+    my @current-env = ($config<Env> // []).List.flat;
+
+    # 4. Merge new env vars (update existing, append new)
+    my %env-map;
+    for @current-env -> $e {
+        my ($k, $v) = $e.split('=', 2);
+        %env-map{$k} = $v if $k;
+    }
+    for %env.kv -> $k, $v {
+        %env-map{$k} = $v;
+    }
+    my @new-env = %env-map.map({ "{$_.key}={$_.value}" }).sort;
+
+    my @changed = %env.keys.sort;
+    note "🔄 Reconfiguring {$existing-name}: {@changed.join(', ')}";
+
+    # 5. Extract current run config
+    my $image = $config<Image> // '';
+    my $network = ($host-config<NetworkMode> // '').Str;
+    my $restart = ($host-config<RestartPolicy> // {}).<Name> // 'always';
+
+    # 6. Stop + remove
+    docker-api('POST', "/containers/{$cid}/stop?t=5");
+    sleep 2;
+    docker-api('DELETE', "/containers/{$cid}?force=true");
+
+    # 7. Recreate with new env
+    my $create-body = to-json({
+        :Image($image),
+        :Env(@new-env),
+        :HostConfig({
+            :NetworkMode($network),
+            :RestartPolicy({ :Name($restart) }),
+            :Binds($host-config<Binds> // []),
+        }),
+        :Cmd($config<Cmd> // []),
+        :Entrypoint($config<Entrypoint> // []),
+    });
+
+    note "  📦 Creating new {$existing-name}...";
+    my $create = docker-api('POST', "/containers/create?name={$existing-name}", $create-body);
+    return { :error("create failed: {$create<error>}") } if $create<error>;
+
+    my $new-cid = $create<Id> // '';
+    return { :error("no container ID returned") } unless $new-cid;
+
+    # 8. Start
+    docker-api('POST', "/containers/{$new-cid}/start");
+
+    note "  ✅ Reconfigured {$existing-name} (new: {$new-cid.substr(0, 12)}, changed: {@changed.join(', ')})";
+
+    return {
+        :ok(True),
+        :container($existing-name),
+        :new_id($new-cid.substr(0, 12)),
+        :env_changed(@changed),
+    };
+}
+
 # ── Topic router ──
 sub dispatch(Str $topic, %args --> Hash) {
     given $topic {
@@ -174,8 +261,9 @@ sub dispatch(Str $topic, %args --> Hash) {
         when 'system_health'     { handle-system-health() }
         when 'session_get'       { handle-session-get(%args<session_id> // '') }
         when 'session_list'      { handle-session-list() }
+        when 'reconfigure'       { handle-reconfigure(%args<container> // '', %args<env> // {}) }
         default {
-            { :error("Unknown topic: $topic. Available: containers_list, container_detail, system_health, session_get, session_list") }
+            { :error("Unknown topic: $topic. Available: containers_list, container_detail, system_health, session_get, session_list, reconfigure") }
         }
     }
 }
@@ -216,7 +304,7 @@ react {
         if $msg.?reply-to {
             $nats.publish: $msg.reply-to, to-json({
                 :status<ok>, :service<worker-system>,
-                :topics(['containers_list', 'container_detail', 'system_health']),
+                :topics(['containers_list', 'container_detail', 'system_health', 'session_get', 'session_list', 'reconfigure']),
             });
         }
     }

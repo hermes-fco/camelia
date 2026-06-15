@@ -29,6 +29,7 @@ Available worker types:
   • system_health — overall health summary (running/stopped counts, all containers)
   • session_get — args: {"session_id":"sess-xxx"} — get session data and history
   • session_list — list all active session IDs
+  • reconfigure — args: {"container":"camelia-orchestrator", "env":{"MAX_WORKERS":"5"}} — change env vars and restart container
 
 The system containers are: camelia-nats, camelia-orchestrator, camelia-spawner,
 camelia-worker-model-deepseek, camelia-tool-executor, camelia-session-store,
