@@ -97,6 +97,7 @@ my $task-sub   = $nats.subscribe: 'orchestrator.task';
 my $health-sub = $nats.subscribe: 'health.check.orchestrator';
 my $registry-sub = $nats.subscribe: 'worker.registry';
 note "🟢 Orchestrator subscribed, entering react...";
+my $task-chan = Channel.new;
 
 react {
     # ── JetStream setup: run concurrently so subscriptions are already tapped ──
@@ -105,7 +106,7 @@ react {
         setup-jetstream();
     }
 
-    whenever $task-sub.supply -> $msg {
+    whenever $task-chan -> $msg {
         next unless $msg.payload;
         my $reply-to = $msg.?reply-to;
         unless $reply-to {
@@ -280,7 +281,33 @@ sub setup-jetstream() {
         note $c-msg ?? "  ✅ Consumer {$consumer-name}" !! "  ⚠️ Consumer {$consumer-name} failed";
     }
 
-    note "✅ JetStream ready ({+@WORKER-TYPES} streams).";
+    note "✅ JetStream ready ({+@WORKER-TYPES} worker streams).";
+
+    # ── Orchestrator own task stream + consumer → Channel ──
+    my $ts = Nats::Stream.new:
+        :$nats, :name<ORCHESTRATOR_TASKS>,
+        :subjects(["orchestrator.task"]),
+        :retention<limits>, :max-age(86_400_000_000_000),
+        ;
+    my $tss = $ts.create; my $tsm = await $tss.Promise;
+    note $tsm ?? "  ✅ Stream ORCHESTRATOR_TASKS" !! "  ⚠️ ORCHESTRATOR_TASKS";
+
+    my $tc = Nats::Consumer.new:
+        :$nats, :name<orchestrator-main>, :stream<ORCHESTRATOR_TASKS>,
+        :ack-policy<explicit>, :deliver-policy<all>,
+        :filter-subject("orchestrator.task"),
+        :max-ack-pending(10), :ack-wait(120), :replay-policy<instant>,
+        ;
+    my $tcs = $tc.create-named;
+    my $tcm = await $tcs.Promise;
+    note ($tcm && $tcm.payload && !$tcm.payload.starts-with("-ERR"))
+        ?? "  ✅ Consumer orchestrator-main → Channel"
+        !! "  ⚠️ Consumer: {$tcm.?payload // "no response"}";
+
+    $tc.msgs(:batch(5), :no-wait).tap: -> $msg {
+        $task-chan.send($msg) if $msg.payload;
+    };
+    note "🔄 Orchestrator task consumer ready.";
 }
 
 # ═════════════════════════════════════════════
