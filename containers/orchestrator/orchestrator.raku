@@ -14,7 +14,7 @@ my $nats-url     = %*ENV<NATS_URL>      // 'nats://127.0.0.1:4222';
 my $max-workers  = %*ENV<MAX_WORKERS>    // 3;
 my $start-time   = now;                  # for uptime metric
 my $tasks-done   = 0;                    # completed task counter
-my $model-subject = %*ENV<MODEL_SUBJECT> // 'worker.model.deepseek.completion';
+my $model-subject = %*ENV<MODEL_SUBJECT> // 'model.deepseek.completion';
 
 # ── System prompts ──
 
