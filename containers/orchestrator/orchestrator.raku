@@ -351,6 +351,20 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?, Str $chat-id?) {
 
     stream($sid, 'received', :message("Task received: {$prompt.substr(0, 80)}..."));
 
+    # ═══════ Fast path: conversational shortcut (skip decomposition) ═══════
+    # Messages that are short and don't contain action-trigger words
+    # go direct to synthesis — saves one model call (~0.5-2s).
+    my $action-words = rx:i/<< container system restart config list show run check
+        | status get set update change deploy build test docker compose
+        | nats worker shell exec command health reconfigure skill >>/;
+    if $prompt.chars < 80 && $prompt !~~ $action-words {
+        note "💬 Fast path — conversational, direct synthesis";
+        stream($sid, 'decomposed', :message("Conversational — direct response"), :subtask_count(0));
+        synthesize-and-respond($prompt, $reply-to, $sid, $seq, $chat-id, @history, []);
+        $tasks-done++;
+        return;
+    }
+
     # ═══════ STEP 1: Decompose (with history from session-store) ═══════
     note "📋 Decomposing (session {$sid}, task #{$task-n})...";
     my @decomp-msgs = (
