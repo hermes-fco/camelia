@@ -26,15 +26,6 @@ sub lifecycle(Str $event) {
     $nats.publish: "{$lifecycle-subject}.{$event}",
         to-json({ :$worker-id, :type<shell>, :$event, :ts(now.Real) });
 }
-
-# ── Worker registry payload (sent from react after orchestrator taps supply) ──
-my $registry-msg = to-json({
-    :name<shell>,
-    :subject('worker.shell.task.>'),
-    :description('Executes a SINGLE bash one-liner. Chain with && or ;'),
-    :topics([]),
-});
-
 # Subscribe to all shell worker tasks
 my $task-sub = $nats.subscribe: 'worker.shell.>';
 note "🟢 Listening on worker.shell.>";
@@ -64,7 +55,6 @@ react {
     # ── Publish lifecycle.started + registry after spawner/orchestrator react is tapped ──
     start {
         sleep 0.5;
-        $nats.publish: 'worker.registry', $registry-msg;
         lifecycle('started');
     }
 

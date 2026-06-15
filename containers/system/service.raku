@@ -28,15 +28,6 @@ sub lifecycle(Str $event) {
     $nats.publish: "{$lifecycle-subject}.{$event}",
         to-json({ :$worker-id, :type<system>, :$event, :ts(now.Real) });
 }
-
-# ── Worker registry payload (sent from react after orchestrator taps supply) ──
-my $registry-msg = to-json({
-    :name<system>,
-    :subject('worker.system.task.>'),
-    :description('Queries Camélia system: container status, health, sessions, reconfiguration'),
-    :topics(['containers_list', 'container_detail', 'system_health', 'session_get', 'session_list', 'reconfigure']),
-});
-
 my $task-sub   = $nats.subscribe: 'worker.system.task.>';
 my $health-sub = $nats.subscribe: 'health.check.worker.system';
 note "🟢 Listening on worker.system.task.>";
@@ -293,7 +284,6 @@ react {
     # Publish started AFTER react is running (spawner needs time to tap supplies)
     start {
         sleep 0.5;
-        $nats.publish: 'worker.registry', $registry-msg;
         lifecycle('started');
     }
 

@@ -17,7 +17,7 @@ my $tasks-done   = 0;                    # completed task counter
 my $model-subject = %*ENV<MODEL_SUBJECT> // 'model.deepseek.completion';
 
 # ── Worker Registry (dynamic — updated as workers register) ──
-# Workers publish metadata to worker.registry on startup.
+# Worker metadata stored in KV_WORKER_REGISTRY (JetStream KV)
 # Orchestrator uses this to build decomposition prompt dynamically.
 # factory is always available (hardcoded fallback).
 my %workers = (
@@ -95,7 +95,7 @@ $nats.connect;
 
 my $task-sub   = $nats.subscribe: 'orchestrator.task';
 my $health-sub = $nats.subscribe: 'health.check.orchestrator';
-my $registry-sub = $nats.subscribe: 'worker.registry';
+my $registry-sub = $nats.subscribe: '$KV.WORKER_REGISTRY.>';
 note "🟢 Orchestrator subscribed, entering react...";
 my $task-chan = Channel.new;
 
@@ -307,6 +307,39 @@ sub setup-jetstream() {
     $tc.msgs(:batch(5), :no-wait).tap: -> $msg {
         $task-chan.send($msg) if $msg.payload;
     };
+
+    # ── Worker Registry KV (persistent, survives restart) ──
+    note "📋 Creating Worker Registry KV...";
+    my $kv = Nats::Stream.new:
+        :$nats, :name<KV_WORKER_REGISTRY>,
+        :subjects(["\$KV.WORKER_REGISTRY.>"]),
+        :retention<limits>,
+        :max-msgs-per-subject(1),
+        :discard<new>,
+        ;
+    my $kvs = $kv.create;
+    my $kvm = await $kvs.Promise;
+    note $kvm ?? "  ✅ KV KV_WORKER_REGISTRY" !! "  ⚠️ KV_WORKER_REGISTRY";
+
+    # Seed default workers (factory writes new ones)
+    note "  🌱 Seeding default workers...";
+    my %defaults = (
+        shell => { :name<shell>, :subject("worker.shell.task.>"),
+                   :description("Executes a SINGLE bash one-liner. Chain with && or ;"), :topics([]) },
+        "web-browser" => { :name<web-browser>, :subject("worker.web-browser.task.>"),
+                   :description("Fetches URLs, renders JavaScript, extracts readable text"), :topics([]) },
+        system => { :name<system>, :subject("worker.system.task.>"),
+                   :description("Queries Camelia system: containers, health, sessions, reconfig"),
+                   :topics(["containers_list","container_detail","system_health","session_get","session_list","reconfigure"]) },
+        factory => { :name<factory>, :subject("worker.factory.request"),
+                   :description("Creates new worker types from specifications"), :topics([]) },
+    );
+    for %defaults.kv -> $name, %meta {
+        $nats.publish: "\$KV.WORKER_REGISTRY.{$name}", to-json(%meta);
+        %workers{$name} = %meta;
+        note "    📌 {$name}";
+    }
+    note "  ✅ Registry seeded ({+%defaults} workers).";
     note "🔄 Orchestrator task consumer ready.";
 }
 

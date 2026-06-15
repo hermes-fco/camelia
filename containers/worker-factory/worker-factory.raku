@@ -56,15 +56,6 @@ sub lifecycle(Str $event) {
     $nats.publish: "{$lifecycle-subject}.{$event}",
         to-json({ :$worker-id, :type<factory>, :$event, :ts(now.Real) });
 }
-
-# ── Worker registry payload (sent from react after orchestrator taps supply) ──
-my $registry-msg = to-json({
-    :name<factory>,
-    :subject('worker.factory.request'),
-    :description('Creates new worker types from specifications. Use to add capabilities'),
-    :topics([]),
-});
-
 my $task-sub   = $nats.subscribe: 'worker.factory.request';
 my $health-sub = $nats.subscribe: 'health.check.worker.factory';
 note "🟢 Listening on worker.factory.request";
@@ -288,7 +279,15 @@ sub handle-factory-request(%req, Str $reply-to) {
         note "  ⚠️ Factory: {$name} code generated but image build failed";
         return;
     }
-
+    # Write to Worker Registry KV so orchestrator discovers this worker
+    my $kv-subject = "\$KV.WORKER_REGISTRY.{$name}";
+    $nats.publish: $kv-subject, to-json({
+        :$name,
+        :subject("worker.{$name}.task.>"),
+        :description(%spec<description> // "Worker {$name}"),
+        :topics([]),
+    });
+    note "  📋 Registered {$name} in KV_WORKER_REGISTRY";
     # Final response
     $nats.publish: $reply-to, to-json({
         :status<created>,
@@ -305,7 +304,6 @@ sub handle-factory-request(%req, Str $reply-to) {
 react {
     start {
         sleep 0.5;
-        $nats.publish: 'worker.registry', $registry-msg;
         lifecycle('started');
     }
 

@@ -25,15 +25,6 @@ sub lifecycle(Str $event) {
     $nats.publish: "{$lifecycle-subject}.{$event}",
         to-json({ :$worker-id, :type<web-browser>, :$event, :ts(now.Real) });
 }
-
-# ── Worker registry payload (sent from react after orchestrator taps supply) ──
-my $registry-msg = to-json({
-    :name<web-browser>,
-    :subject('worker.web-browser.task.>'),
-    :description('Fetches URLs, renders JavaScript, extracts readable text. Use for ANY web/HTTP task'),
-    :topics([]),
-});
-
 # ── Check for headless browser ──
 sub find-headless-browser(--> Str) {
     for <chromium-browser chromium google-chrome google-chrome-stable> -> $bin {
@@ -214,7 +205,6 @@ react {
     # Publish started AFTER react is running (spawner needs time to tap supplies)
     start {
         sleep 0.5;
-        $nats.publish: 'worker.registry', $registry-msg;
         lifecycle('started');
     }
 
