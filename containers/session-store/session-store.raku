@@ -29,19 +29,21 @@ await $nats.start;
 $nats.connect;
 note "🟢 Session Store connected.";
 
-# ── JetStream stream setup ──
-my $stream = setup-stream();
-note "✅ Stream SESSIONS ready.";
-
 # ── Subscribe: one wildcard + health ──
 my $main-sub   = $nats.subscribe: 'session.store.>';
 my $health-sub = $nats.subscribe: 'health.check.session-store';
+my $stream;      # initialized inside react after subscriptions are tapped
 
 # ═════════════════════════════════════════════
 # MAIN LOOP — react + whenever (preferred pattern)
 # ═════════════════════════════════════════════
 
 react {
+    # ── JetStream stream setup: run concurrently so subscriptions are tapped ──
+    start {
+        $stream = setup-stream();
+        note "✅ Stream SESSIONS ready.";
+    }
     whenever $main-sub.supply -> $msg {
         next unless $msg.payload;
         my $reply-to = $msg.?reply-to;

@@ -28,7 +28,7 @@ RUN zef install URL JSON::Fast HTTP::Tinyish
 # Verify
 RUN raku -v
 
-# nats.raku
+# nats.raku (from forks, not yet in zef ecosystem)
 COPY lib/nats.raku /opt/nats.raku/
 RUN raku -I /opt/nats.raku -e 'use Nats; say "✅ NATS OK"'
 

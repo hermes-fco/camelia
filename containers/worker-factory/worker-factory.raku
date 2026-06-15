@@ -14,6 +14,7 @@ $*ERR.out-buffer = False;
 my $nats-url      = %*ENV<NATS_URL>       // 'nats://127.0.0.1:4222';
 my $model-subject = %*ENV<MODEL_SUBJECT>   // 'model.deepseek.completion';
 my $max-retries   = %*ENV<FACTORY_RETRIES> // 3;
+my $worker-id     = ('fc' ~ (^1000).pick).Str;
 
 # ── Load template ──
 my $template-path = '/opt/camelia/templates/worker-api.raku';
@@ -49,9 +50,27 @@ await $nats.start;
 $nats.connect;
 note "🟢 Factory connected.";
 
+# ── Lifecycle events ──
+my $lifecycle-subject = "worker.status.factory.{$worker-id}";
+sub lifecycle(Str $event) {
+    $nats.publish: "{$lifecycle-subject}.{$event}",
+        to-json({ :$worker-id, :type<factory>, :$event, :ts(now.Real) });
+}
+
+# ── Worker registry payload (sent from react after orchestrator taps supply) ──
+my $registry-msg = to-json({
+    :name<factory>,
+    :subject('worker.factory.request'),
+    :description('Creates new worker types from specifications. Use to add capabilities'),
+    :topics([]),
+});
+
 my $task-sub   = $nats.subscribe: 'worker.factory.request';
 my $health-sub = $nats.subscribe: 'health.check.worker.factory';
 note "🟢 Listening on worker.factory.request";
+
+# ── Track idle time ──
+my $last-activity = now;
 
 # ── Model call helper ──
 sub call-model(@messages, :$temperature = 0.1 --> Hash) {
@@ -111,7 +130,32 @@ END
         return False;
     }
     note "  ✅ Image {$image-name} built";
+    create-worker-stream($name);
     return True;
+
+# ── Create JetStream stream for new worker type ──
+sub create-worker-stream(Str $name) {
+    my $stream-name = "WORKER_" ~ $name.uc.subst("-", "_");
+    my $subject     = "worker.{$name}.task.>";
+
+    note "  📡 Creating JetStream stream {$stream-name} ({$subject})...";
+
+    my $config = to-json({
+        :name($stream-name),
+        :subjects([$subject]),
+        :retention<limits>,
+        :storage<file>,
+        :max-age(86_400_000_000_000),
+    });
+
+    my $supply = $nats.request("\$JS.API.STREAM.CREATE.{$stream-name}", $config);
+    my $msg = await $supply.head.Promise;
+    if $msg && $msg.payload && !$msg.payload.starts-with("-ERR") {
+        note "  ✅ Stream {$stream-name} created";
+    } else {
+        note "  ⚠️ Stream create: {$msg.?payload // "no response"} (may already exist)";
+    }
+}
 }
 
 # ── Generate code via model ──
@@ -259,6 +303,12 @@ sub handle-factory-request(%req, Str $reply-to) {
 
 # ── React loop ──
 react {
+    start {
+        sleep 0.5;
+        $nats.publish: 'worker.registry', $registry-msg;
+        lifecycle('started');
+    }
+
     whenever $task-sub.supply -> $msg {
         next unless $msg.payload;
         my $reply-to = $msg.?reply-to;
@@ -273,8 +323,14 @@ react {
             next;
         }
 
+        $last-activity = now;
+        lifecycle('busy');
+
         start {
             handle-factory-request(%req, $reply-to);
+
+            $last-activity = now;
+            lifecycle('idle');
         }
     }
 
@@ -282,6 +338,8 @@ react {
         if $msg.?reply-to {
             $nats.publish: $msg.reply-to, to-json({
                 :status<ok>, :service<worker-factory>,
+                :$worker-id,
+                :idle_seconds((now - $last-activity).Int),
             });
         }
     }

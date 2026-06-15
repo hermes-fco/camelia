@@ -3,20 +3,37 @@
 #
 # Subscribes to worker.shell.> — receives tool execution requests,
 # forwards to tool-executor, returns results.
-# Direct NATS request-reply, no JetStream for simplicity.
+# Lifecycle events published to worker.status.shell.<id>.*
+# Direct NATS request-reply, JetStream-backed for buffer/spawner visibility.
 
 use Nats;
 use JSON::Fast;
 
 $*ERR.out-buffer = False;
 
-my $nats-url = %*ENV<NATS_URL> // 'nats://127.0.0.1:4222';
+my $nats-url  = %*ENV<NATS_URL>  // 'nats://127.0.0.1:4222';
+my $worker-id = ('s' ~ (^10000).pick).Str;
 
-note "🟡 Worker-Shell connecting NATS ($nats-url)...";
+note "🟡 Worker-Shell-{$worker-id} connecting NATS ($nats-url)...";
 my $nats = Nats.new: :servers[$nats-url];
 await $nats.start;
 $nats.connect;
-note "🟢 Worker-Shell connected.";
+note "🟢 Worker-Shell-{$worker-id} connected.";
+
+# ── Lifecycle events: published to worker.status.shell.<id>.<event> ──
+my $lifecycle-subject = "worker.status.shell.{$worker-id}";
+sub lifecycle(Str $event) {
+    $nats.publish: "{$lifecycle-subject}.{$event}",
+        to-json({ :$worker-id, :type<shell>, :$event, :ts(now.Real) });
+}
+
+# ── Worker registry payload (sent from react after orchestrator taps supply) ──
+my $registry-msg = to-json({
+    :name<shell>,
+    :subject('worker.shell.task.>'),
+    :description('Executes a SINGLE bash one-liner. Chain with && or ;'),
+    :topics([]),
+});
 
 # Subscribe to all shell worker tasks
 my $task-sub = $nats.subscribe: 'worker.shell.>';
@@ -24,6 +41,9 @@ note "🟢 Listening on worker.shell.>";
 
 # Health check
 my $health-sub = $nats.subscribe: 'health.check.worker.shell';
+
+# ── Track idle time (for spawner GC) ──
+my $last-activity = now;
 
 # ── Tool execution helper ──
 sub exec-tool(Str $name, Str $tc-id, %args --> Hash) {
@@ -41,6 +61,13 @@ sub exec-tool(Str $name, Str $tc-id, %args --> Hash) {
 }
 
 react {
+    # ── Publish lifecycle.started + registry after spawner/orchestrator react is tapped ──
+    start {
+        sleep 0.5;
+        $nats.publish: 'worker.registry', $registry-msg;
+        lifecycle('started');
+    }
+
     whenever $task-sub.supply -> $msg {
         next unless $msg.payload;
         my $reply-to = $msg.?reply-to;
@@ -59,6 +86,9 @@ react {
         my $tc-id  = %task<id>     // 'unknown';
         my %args   = %task<arguments> // {};
 
+        $last-activity = now;
+        lifecycle('busy');
+
         # Natural language fallback: treat 'task' field as a shell command
         if $tool {
             note "🔧 Shell worker: {$tool} ({$tc-id})";
@@ -71,6 +101,7 @@ react {
                 %args = :command($shell-cmd);
             } else {
                 $nats.publish: $reply-to, to-json({ :error("Missing 'tool' or 'task' field") });
+                lifecycle('idle');
                 next;
             }
         }
@@ -88,6 +119,9 @@ react {
             note %tool-resp<error>
                 ?? "  ❌ {$tool}: {%tool-resp<error>}"
                 !! "  ✅ {$tool} done";
+
+            $last-activity = now;
+            lifecycle('idle');
         }
     }
 
@@ -95,6 +129,8 @@ react {
         if $msg.?reply-to {
             $nats.publish: $msg.reply-to, to-json({
                 :status<ok>, :service<worker-shell>,
+                :$worker-id,
+                :idle_seconds((now - $last-activity).Int),
             });
         }
     }

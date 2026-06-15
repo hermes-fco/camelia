@@ -190,6 +190,23 @@ services:
       - NATS_URL=nats://nats:4222
       - SERVICE_NAME=skill-store
 
+  auto-pilot:
+    build:
+      context: .
+      dockerfile: containers/auto-pilot/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+      session-store:
+        condition: service_started
+      orchestrator:
+        condition: service_started
+    environment:
+      - NATS_URL=nats://nats:4222
+      - CHECK_INTERVAL=60
+      - STALE_SECONDS=300
+
   worker-system:
     build:
       context: .

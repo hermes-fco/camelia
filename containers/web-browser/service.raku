@@ -1,25 +1,38 @@
 #!/usr/bin/env raku
-# 🌺 Camélia — Web Browser Worker
+# 🌺 Camélia — Web Browser Worker (JetStream pull consumer)
 #
-# Fetches URLs via curl, with optional chromium headless for JS rendering,
-# plus HTML-to-text extraction.
+# Pulls tasks from WORKER_WEB_BROWSER stream via $consumer.msgs(:batch, :no-wait).
+# Lifecycle events published to worker.status.web-browser.<id>.*
 
 use Nats;
 use JSON::Fast;
 
 $*ERR.out-buffer = False;
 
-my $nats-url = %*ENV<NATS_URL> // 'nats://127.0.0.1:4222';
+my $nats-url     = %*ENV<NATS_URL>     // 'nats://127.0.0.1:4222';
+my $service-name = %*ENV<SERVICE_NAME> // 'worker-web-browser';
+my $worker-id    = ('w' ~ (^10000).pick).Str;
 
-note "🟡 web.browser connecting NATS ($nats-url)...";
+note "🟡 {$service-name}-{$worker-id} connecting NATS ($nats-url)...";
 my $nats = Nats.new: :servers[$nats-url];
 await $nats.start;
 $nats.connect;
-note "🟢 web.browser connected.";
+note "🟢 {$service-name}-{$worker-id} connected.";
 
-my $task-sub   = $nats.subscribe: 'worker.web-browser.task.>';
-my $health-sub = $nats.subscribe: 'health.check.web.browser';
-note "🟢 Listening on web.browser.>";
+# ── Lifecycle event publisher ──
+my $lifecycle-subject = "worker.status.web-browser.{$worker-id}";
+sub lifecycle(Str $event) {
+    $nats.publish: "{$lifecycle-subject}.{$event}",
+        to-json({ :$worker-id, :type<web-browser>, :$event, :ts(now.Real) });
+}
+
+# ── Worker registry payload (sent from react after orchestrator taps supply) ──
+my $registry-msg = to-json({
+    :name<web-browser>,
+    :subject('worker.web-browser.task.>'),
+    :description('Fetches URLs, renders JavaScript, extracts readable text. Use for ANY web/HTTP task'),
+    :topics([]),
+});
 
 # ── Check for headless browser ──
 sub find-headless-browser(--> Str) {
@@ -50,14 +63,11 @@ sub curl-fetch(Str $url, Int :$timeout = 15 --> Hash) {
     my $output = '';
     $proc.stdout.lines(:chomp).tap(-> $l { $output ~= "$l\n" });
     my $result = await $proc.start;
-
-        return { :ok(False), :error("curl exit={$result.exitcode}") } if $result.exitcode != 0;
-
+    return { :ok(False), :error("curl exit={$result.exitcode}") } if $result.exitcode != 0;
     my @lines = $output.lines;
     my $status = @lines.pop // '0';
     $status ~~ s/^\s+|\s+$//;
     my $content = @lines.join("\n");
-
     if $status ~~ /^2/ {
         return { :ok(True), :$content, :status($status.Int) };
     }
@@ -67,13 +77,11 @@ sub curl-fetch(Str $url, Int :$timeout = 15 --> Hash) {
 # ── chromium render ──
 sub chromium-render(Str $url, Int :$timeout = 15 --> Hash) {
     unless $headless-bin {
-        # Fallback to curl
         my %result = curl-fetch($url, :$timeout);
         %result<js_rendered> = False;
         %result<note> = "JS not rendered (no headless browser available)";
         return %result;
     }
-
     my $proc = Proc::Async.new(
         $headless-bin,
         '--headless', '--disable-gpu', '--no-sandbox',
@@ -84,7 +92,6 @@ sub chromium-render(Str $url, Int :$timeout = 15 --> Hash) {
     my $output = '';
     $proc.stdout.lines(:chomp).tap(-> $l { $output ~= "$l\n" });
     my $result = await $proc.start;
-
     if $result.exitcode != 0 {
         note "⚠️ chromium failed, falling back to curl";
         my %fallback = curl-fetch($url, :$timeout);
@@ -92,131 +99,165 @@ sub chromium-render(Str $url, Int :$timeout = 15 --> Hash) {
         %fallback<note> = "chromium failed, fell back to curl";
         return %fallback;
     }
-
     return { :ok(True), :content($output), :status(200), :js_rendered(True) };
 }
 
 # ── HTML to text ──
 sub html-to-text(Str $html --> Str) {
     my $text = $html;
-
-    # Remove script and style blocks
     $text ~~ s:g:s/'<script' .*? '</script>'//;
     $text ~~ s:g:s/'<style'  .*? '</style>' //;
-
-    # Extract title
-    my $title = '';
-    if $text ~~ /:s '<title>' (.*?) '</title>'/ { $title = $0.Str }
-
-    # Remove all tags
     $text ~~ s:g/'<' <-[>]>* '>'//;
-
-    # Decode common entities
     $text ~~ s:g/'&amp;' /&/;
     $text ~~ s:g/'&lt;'  /</;
     $text ~~ s:g/'&gt;'  />/;
     $text ~~ s:g/'&quot;'/\"/;
-    $text ~~ s:g/'&apos;'/\'/;
+    $text ~~ s:g/'&apos;'/'/;
     $text ~~ s:g/'&nbsp;'/ /;
-
-    # Collapse whitespace
-    $text ~~ s:g/\s+/ /;
-    $text .= trim;
-
+    $text ~~ s:g/^^ \s+//;
+    $text ~~ s:g/\n\n\n+/\n\n/;
     return $text;
 }
 
-# ═══ Tools ═══
-#   fetch   — curl-based fetch, no JS
-#   render  — headless chromium (or curl fallback)
-#   extract — fetch + strip HTML to plain text
+# ── Extract title from HTML ──
+sub extract-title(Str $html --> Str) {
+    if $html ~~ /:s '<title>' (.*?) '</title>'/ { return $0.Str }
+    return '';
+}
+
+# ── Handle task ──
+my $last-activity = now;
+
+sub handle-task(%task, Str $reply-to, $msg) {
+    my $task-str = %task<task> // '';
+    note "📨 {$service-name}-{$worker-id}: {$task-str.substr(0, 80)}...";
+
+    $last-activity = now;
+    lifecycle('busy');
+
+    # Determine if it's a URL or a command
+    my $url = $task-str;
+    if $task-str ~~ /^ 'curl '/ {
+        note "  ⚠️ curl command received, fetching directly...";
+        $url = $task-str.subst(/^ 'curl ' .*? ' '/, '').subst(/\s+.*$/, '');
+    }
+
+    my %result = curl-fetch($url, :timeout(20));
+
+    # If we have a headless browser and curl got a 200, try JS rendering too
+    if %result<ok> && $headless-bin {
+        note "  🔄 Trying JS rendering with chromium...";
+        my %js-result = chromium-render($url, :timeout(25));
+        if %js-result<ok> {
+            note "  ✅ JS render ok ({%js-result<content>.chars} chars)";
+            my $text  = html-to-text(%js-result<content>);
+            my $title = extract-title(%js-result<content>);
+            %result = { :ok(True), :$title, :$text, :status(200), :js_rendered(True) };
+        }
+    } elsif %result<ok> {
+        my $text  = html-to-text(%result<content>);
+        my $title = extract-title(%result<content>);
+        %result = { :ok(True), :$title, :$text, :status(%result<status>), :js_rendered(False) };
+    }
+
+    %result<worker-id> = $worker-id;
+    $nats.publish: $reply-to, to-json(%result);
+    note "  ✅ Result sent to {$reply-to} (" ~ (%result<text> // %result<content> // '').chars ~ " chars)";
+
+    $last-activity = now;
+    lifecycle('idle');
+}
+
+# ═════════════════════════════════════════════
+# JETSTREAM CONSUMER — async pull via .msgs
+# ═════════════════════════════════════════════
+
+my $stream-name = 'WORKER_WEB_BROWSER';
+note "📥 Creating JetStream consumer on {$stream-name}...";
+
+my $stream = Nats::Stream.new:
+    :$nats,
+    :name($stream-name),
+    ;
+
+my $consumer-name = "{$service-name}-{$worker-id}";
+my $consumer = Nats::Consumer.new:
+    :$nats,
+    :name($consumer-name),
+    :stream($stream-name),
+    :ack-policy<explicit>,
+    :deliver-policy<all>,
+    :filter-subject('worker.web-browser.task.>'),
+    :max-ack-pending(5),
+    :ack-wait(120),
+    :replay-policy<instant>,
+    ;
+
+my $c-supply = $consumer.create-named;
+my $c-msg   = await $c-supply.Promise;
+if $c-msg && $c-msg.payload && !$c-msg.payload.starts-with('-ERR') {
+    note "  ✅ Consumer {$consumer-name} created";
+} else {
+    note "  ⚠️ Consumer create: {$c-msg.?payload // 'no response'}";
+}
+
+# Health check
+my $health-sub = $nats.subscribe: 'health.check.web.browser';
+
+# ═════════════════════════════════════════════
+# MAIN REACT LOOP — assíncrono, sem polling
+# ═════════════════════════════════════════════
+
+note "🔄 Async pull loop ready — {$consumer-name}";
 
 react {
-    whenever $task-sub.supply -> $msg {
+    # Publish started AFTER react is running (spawner needs time to tap supplies)
+    start {
+        sleep 0.5;
+        $nats.publish: 'worker.registry', $registry-msg;
+        lifecycle('started');
+    }
+
+    # ── Pull messages from JetStream — :batch, :no-wait (Fernando's pattern) ──
+    whenever $consumer.msgs(:batch(5), :no-wait) -> $msg {
         next unless $msg.payload;
-        my $reply-to = $msg.?reply-to;
-        unless $reply-to {
-            note "⚠️ No reply-to, ignoring";
-            next;
+
+        if $msg.payload.starts_with('-ERR') {
+            note "⚠️ JetStream: {$msg.payload}";
+            last;
         }
 
-        my %task = try from-json($msg.payload);
+        my %task;
+        try { %task = from-json($msg.payload) };
         if $! {
-            $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
+            note "⚠️ Invalid JSON payload: {$!.message.substr(0, 80)}";
+            $consumer.nak($msg);
             next;
         }
 
-        my $action = %task<action> // '';
-        note "📨 web.browser: {$action}";
+        my $reply-to = %task<reply_to> // '';
+        unless $reply-to {
+            note "⚠️ Task without reply-to, skipping";
+            $consumer.ack($msg);
+            next;
+        }
 
         start {
-            my %result = handle-task(%task);
-            $nats.publish: $reply-to, to-json(%result);
+            handle-task(%task, $reply-to, $msg);
+            $consumer.ack($msg);
         }
     }
 
+    # ── Health check (with idle_seconds for spawner GC) ──
     whenever $health-sub.supply -> $msg {
         if $msg.?reply-to {
             $nats.publish: $msg.reply-to, to-json({
                 :status<ok>, :service<web.browser>,
                 :headless_browser($headless-bin // 'none'),
+                :$worker-id,
+                :last_activity($last-activity.Real),
+                :idle_seconds((now - $last-activity).Int),
             });
-        }
-    }
-}
-
-sub handle-task(%task --> Hash) {
-    # If no 'action' but has 'task', auto-detect: URLs → extract, commands → shell
-    if !%task<action> && %task<task> {
-        my $cmd = %task<task>;
-        if $cmd.contains('https://') || $cmd.contains('http://') {
-            # Extract URL and auto-extract (fetch + strip HTML)
-            if $cmd ~~ /(https? '://' \S+)/ {
-                %task<url> = $0.Str;
-                %task<action> = 'extract';
-            }
-        }
-        # If still no action (URL regex failed or no URL found), run as shell
-        unless %task<action> {
-            my $proc = Proc::Async.new('sh', '-c', $cmd);
-            my ($out, $err) = ('', '');
-            $proc.stdout.lines(:chomp).tap(-> $l { $out ~= "$l\n" });
-            $proc.stderr.lines(:chomp).tap(-> $l { $err ~= "$l\n" });
-            my $r = await $proc.start;
-            return { :ok($r.exitcode == 0), :stdout($out), :stderr($err), :exit($r.exitcode) };
-        }
-    }
-    given %task<action> // '' {
-        when 'fetch' {
-            my $url     = %task<url> // '';
-            return { :error("Missing 'url'") } unless $url;
-            my $timeout = %task<timeout> // 15;
-            return curl-fetch($url, :$timeout);
-        }
-        when 'render' {
-            my $url     = %task<url> // '';
-            return { :error("Missing 'url'") } unless $url;
-            my $timeout = %task<timeout> // 15;
-            return chromium-render($url, :$timeout);
-        }
-        when 'extract' {
-            my $url     = %task<url> // '';
-            return { :error("Missing 'url'") } unless $url;
-            my $timeout = %task<timeout> // 15;
-
-            my %fetch = curl-fetch($url, :$timeout);
-            return %fetch unless %fetch<ok>;
-
-            my $text  = html-to-text(%fetch<content>);
-            my $title = '';
-            if %fetch<content> ~~ /:s '<title>' (.*?) '</title>'/ {
-                $title = $0.Str;
-            }
-
-            return { :ok(True), :$text, :$title, :status(%fetch<status>) };
-        }
-        default {
-            return { :error("Unknown action '{%task<action>}'. Available: fetch, render, extract") };
         }
     }
 }

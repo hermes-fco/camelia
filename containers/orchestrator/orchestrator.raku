@@ -16,39 +16,46 @@ my $start-time   = now;                  # for uptime metric
 my $tasks-done   = 0;                    # completed task counter
 my $model-subject = %*ENV<MODEL_SUBJECT> // 'model.deepseek.completion';
 
-# ── System prompts ──
+# ── Worker Registry (dynamic — updated as workers register) ──
+# Workers publish metadata to worker.registry on startup.
+# Orchestrator uses this to build decomposition prompt dynamically.
+# factory is always available (hardcoded fallback).
+my %workers = (
+    factory => {
+        :name<factory>,
+        :subject('worker.factory.request'),
+        :description('Creates new worker types from specifications. Use to add capabilities'),
+        :topics([]),
+    },
+);
 
-my $decomp-system = q:to/END/;
+sub build-decomp-prompt(--> Str) {
+    my @lines = q:to/END/.lines;
 You are a task orchestrator. Break down complex tasks into parallel subtasks.
 
 Available worker types:
-- worker.shell — executes a SINGLE bash one-liner. The 'task' field MUST be a valid bash command (not a description). Chain with && or ; for multiple steps. Use ONLY for simple commands (echo, date, grep, ls, cat, wc). Do NOT use for web/HTTP tasks.
-- worker.system — queries the Camélia system. The 'task' field is a TOPIC NAME (not a shell command). Available topics:
-  • containers_list — list all Camélia containers with state/status
-  • container_detail — args: {"name":"camelia-<name>"} — detailed info on one container
-  • system_health — overall health summary (running/stopped counts, all containers)
-  • session_get — args: {"session_id":"sess-xxx"} — get session data and history
-  • session_list — list all active session IDs
-  • reconfigure — args: {"container":"camelia-orchestrator", "env":{"MAX_WORKERS":"5"}} — change env vars and restart container
-- worker.web-browser — fetches URLs, renders JavaScript pages, extracts readable text from HTML. Use for ANY web/HTTP task: fetching pages, scraping content, calling APIs, downloading data. The 'task' field is a URL or shell command (curl with -L for redirects, or curl -s -o output). Always prefer this over worker.shell for HTTP tasks.
+END
 
-The system containers are: camelia-nats, camelia-orchestrator, camelia-spawner,
-camelia-worker-model-deepseek, camelia-tool-executor, camelia-session-store,
-camelia-entry-telegram, camelia-worker-shell, camelia-worker-factory,
-camelia-entry-factory, camelia-api-time, camelia-raku-compile, camelia-web-browser,
-camelia-skill-store, camelia-worker-system.
+    for %workers.values.sort({ .<name> }) -> %w {
+        my $name = %w<name>;
+        my $desc = %w<description> // '';
+        my @topics = (%w<topics> // []).List;
 
-A Skill Store is available at skill.store.* (NATS request-reply). Query it when
-you need procedural knowledge. Available skills:
-  • nats-troubleshooting — debug NATS streams and connections
-  • docker-container-management — manage Camelia Docker containers
-  • container-health-overview — full system health check procedure
+        @lines.push: "- {$name} — {$desc}";
+        if @topics {
+            for @topics -> $t {
+                @lines.push: "  • {$t}";
+            }
+        }
+    }
 
+    @lines.push: '';
+    @lines.append: q:to/END/.lines;
 Given a user request — and optionally conversation history — decide if it needs tool calls or can be answered directly.
 
 **If the request is conversational** (greetings, chitchat, emotional support, follow-up questions that don't need external data), output an EMPTY array: `[]`
 
-**If the request requires action** (shell commands, system queries, container management), decompose it into 1-3 INDEPENDENT subtasks that can be executed by worker agents.
+**If the request requires action**, decompose it into 1-3 INDEPENDENT subtasks that can be executed by worker agents.
 
 Output ONLY a JSON array (empty or with subtask objects):
 []
@@ -56,24 +63,23 @@ Output ONLY a JSON array (empty or with subtask objects):
   {
     "id": "task-1",
     "role": "brief role description",
-    "worker_type": "shell",
-    "task": "echo hello && date"
+    "worker_type": "<name from list above>",
+    "task": "the action to perform"
   }
 ]
 
-For system queries, use worker_type "system" and the task is the topic name:
-  {"id":"t1","role":"list containers","worker_type":"system","task":"containers_list"}
-  {"id":"t1","role":"check nats","worker_type":"system","task":"container_detail","args":{"name":"camelia-nats"}}
-
 Rules:
-- The 'task' field for shell MUST be a runnable bash command — never a natural language instruction
-- The 'task' field for system MUST be one of the listed topics — never a shell command
+- The 'task' field MUST be an actionable value — command, URL, topic name, or description
 - Use && to chain commands, ; for independent ones. Keep it under 500 chars
 - Subtasks MUST be independent (no dependencies between them)
-- Every subtask needs a "worker_type" field: "shell" for commands, "system" for container queries, "factory" for creating new workers
+- Every subtask needs a "worker_type" field matching one of the available types
 - If conversation history is provided, use it to maintain continuity
+- Worker type {{factory}} creates NEW worker types — use when needed capability doesn't exist
 - Output ONLY the JSON array, nothing else — no markdown fences, no explanations
 END
+
+    @lines.join("\n");
+}
 
 my $synth-system = q:to/END/;
 You are a synthesis agent. Given the original request and individual worker results, combine them into a single coherent response.
@@ -87,16 +93,18 @@ my $nats = Nats.new: :servers[$nats-url];
 await $nats.start;
 $nats.connect;
 
-my $task-sub = $nats.subscribe: 'orchestrator.task';
+my $task-sub   = $nats.subscribe: 'orchestrator.task';
+my $health-sub = $nats.subscribe: 'health.check.orchestrator';
+my $registry-sub = $nats.subscribe: 'worker.registry';
 note "🟢 Orchestrator subscribed, entering react...";
 
-# ── JetStream setup (infrastructure, runs once at startup) ──
-setup-jetstream();
-
-# Health check + metrics
-my $health-sub = $nats.subscribe: 'health.check.orchestrator';
-
 react {
+    # ── JetStream setup: run concurrently so subscriptions are already tapped ──
+    # Must run INSIDE react, otherwise Supplier loses messages during await
+    start {
+        setup-jetstream();
+    }
+
     whenever $task-sub.supply -> $msg {
         next unless $msg.payload;
         my $reply-to = $msg.?reply-to;
@@ -138,8 +146,20 @@ react {
                 :service<orchestrator>,
                 :$uptime,
                 :tasks_completed($tasks-done),
+                :registered_workers(%workers.elems),
             });
         }
+    }
+
+    # ── Worker registry: update %workers as workers register ──
+    whenever $registry-sub.supply -> $msg {
+        next unless $msg.payload;
+        my %w = try from-json($msg.payload);
+        next if $!;
+        next unless %w<name>;
+        my $name = %w<name>;
+        %workers{$name} = %w;
+        note "📋 Registry: +{$name} (%workers.elems() total: {%workers.keys.sort.join(', ')})";
     }
 }
 
@@ -210,41 +230,57 @@ sub session-append-batch(Str $sid, Int $expected-seq, @entries --> Hash) {
 }
 
 # ═════════════════════════════════════════════
-# JETSTREAM SETUP
+# JETSTREAM SETUP — per-type streams for reliable delivery
 # ═════════════════════════════════════════════
 
+my constant @WORKER-TYPES = <shell web-browser system>;
+my %stream-names;  # worker_type → stream name
+my %consumer-names; # worker_type → durable consumer name
+
 sub setup-jetstream() {
-    note "📦 Setting up JetStream stream + consumer...";
+    note "📦 Setting up JetStream streams (per worker type)...";
 
-    my $stream = Nats::Stream.new:
-        :$nats,
-        :name<WORKER_TASKS>,
-        :subjects(['worker.task.>']),
-        :retention<limits>,
-        ;
+    for @WORKER-TYPES -> $type {
+        my $stream-name = "WORKER_" ~ $type.uc.subst('-', '_');
+        my $subject = "worker.{$type}.task.>";
+        my $consumer-name = "worker-pool-{$type}";
+        %stream-names{$type} = $stream-name;
+        %consumer-names{$type} = $consumer-name;
 
-    my $s-supply = $stream.create;
-    my $s-msg = await $s-supply.Promise;
-    note $s-msg ?? "  ✅ Stream: {$s-msg.payload}" !! "  ⚠️ Stream creation returned no message";
+        my $stream = Nats::Stream.new:
+            :$nats,
+            :name($stream-name),
+            :subjects([$subject]),
+            :retention<limits>,
+            ;
 
-    note "📥 Creating ephemeral pull consumer...";
-    my $consumer-subject = "\$JS.API.CONSUMER.CREATE.WORKER_TASKS.worker-pool";
-    my $consumer-config = to-json({
-        :stream_name<WORKER_TASKS>,
-        :config{
-            :ack_policy<explicit>,
-            :deliver_policy<all>,
-            :filter_subject('worker.task.>'),
-            :max_ack_pending(1),
-            :ack_wait(30_000_000_000),  # 30s in nanoseconds
-            :replay_policy<instant>,
-        },
-    });
-    my $c-resp = $nats.request($consumer-subject, $consumer-config);
-    my $c-msg = await $c-resp.Promise;
-    note $c-msg ?? "  ✅ Consumer created" !! "  ⚠️ Consumer creation returned no message";
+        my $s-supply = $stream.create;
+        my $s-msg = await $s-supply.Promise;
+        note $s-msg ?? "  ✅ Stream {$stream-name} ({$subject})" !! "  ⚠️ Stream {$stream-name} failed";
 
-    note "✅ JetStream ready.";
+        # Each worker will create its own ephemeral consumer.
+        # Durable consumer for monitoring (spawner uses this).
+        note "  📥 Creating durable consumer {$consumer-name}...";
+        my $consumer-subject = "\$JS.API.CONSUMER.CREATE.{$stream-name}.{$consumer-name}";
+        my $consumer-config = to-json({
+            :stream_name($stream-name),
+            :config{
+                :durable_name($consumer-name),
+                :ack_policy<explicit>,
+                :deliver_policy<all>,
+                :filter_subject($subject),
+                :max_ack_pending(20),
+                :ack_wait(60_000_000_000),  # 60s
+                :replay_policy<instant>,
+                :inactive_threshold(300_000_000_000),  # 5 min
+            },
+        });
+        my $c-resp = $nats.request($consumer-subject, $consumer-config);
+        my $c-msg = await $c-resp.Promise;
+        note $c-msg ?? "  ✅ Consumer {$consumer-name}" !! "  ⚠️ Consumer {$consumer-name} failed";
+    }
+
+    note "✅ JetStream ready ({+@WORKER-TYPES} streams).";
 }
 
 # ═════════════════════════════════════════════
@@ -354,8 +390,9 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?, Str $chat-id?) {
 
     # ═══════ STEP 1: Decompose (with history from session-store) ═══════
     note "📋 Decomposing (session {$sid}, task #{$task-n})...";
+    my $decomp-prompt = build-decomp-prompt();
     my @decomp-msgs = (
-        { :role<system>, :content($decomp-system) },
+        { :role<system>, :content($decomp-prompt) },
     );
     for @history -> $entry {
         @decomp-msgs.push: $entry;
@@ -401,32 +438,10 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?, Str $chat-id?) {
         :subtask_count(+@subtasks),
     );
 
-    # ═══════ STEP 2: Ensure ALL needed worker types exist (proactive spawn) ═══════
-    my %needed-types;
-    for @subtasks -> $st {
-        my $wtype = $st<worker_type> // 'shell';
-        %needed-types{$wtype}++ unless $wtype eq 'factory';
-    }
-
-    my $spawned-any = False;
-    for %needed-types.keys -> $wtype {
-        note "🔍 Ensuring worker type '{$wtype}' exists...";
-        my %sr = request-reply('spawner.control',
-            to-json({ :action<ensure_typed>, :type($wtype) }),
-            :timeout(10));
-        if %sr<ok> {
-            note "  ✅ Spawner '{$wtype}': {%sr<status> // 'ready'}";
-            $spawned-any = True;
-        } else {
-            note "  ⚠️ Spawner '{$wtype}': {%sr<error> // 'no response'}";
-        }
-    }
-    if $spawned-any {
-        sleep 2;  # Let workers connect to NATS
-    }
-
-    # ═══════ STEP 3: Publish tasks to typed workers (direct NATS request-reply) ═══════
-    note "📤 Publishing {+@subtasks} tasks to typed workers...";
+    # ═══════ STEP 2: Publish tasks to JetStream-backed worker streams ═══════
+    # Spawner independently monitors streams and spawns workers as needed.
+    # No need to wait for workers — JetStream buffers messages.
+    note "📤 Publishing {+@subtasks} tasks to worker streams...";
 
     my @result-promises;
     for @subtasks -> $st {
@@ -442,46 +457,29 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?, Str $chat-id?) {
         };
         @result-promises.push: $result-promise;
 
-        # Route to typed worker: worker.shell.task.<id>, worker.factory.request, etc.
+        # Route to typed worker stream: worker.<type>.task.<id>
         my $subject = $wtype eq 'factory'
             ?? 'worker.factory.request'
             !! "worker.{$wtype}.task.{$task-id}";
 
         my %payload = :id($task-id), :role($st<role>), :task($st<task>),
-                      :session-id($sid);
+                      :session-id($sid), :reply_to($result-inbox);
 
         # Pass args for system tasks (e.g., container_detail needs name)
         %payload<args> = $st<args> if $st<args>:exists;
 
         # Factory requests need different payload format
         if $wtype eq 'factory' {
-            %payload = :prompt($st<task>), :spec({ :name($task-id), :description($st<role>) });
+            %payload = :prompt($st<task>), :spec({ :name($task-id), :description($st<role>) }), :reply_to($result-inbox);
         }
 
+        # Publish to JetStream-backed subject — worker pulls from stream
         $nats.publish: $subject, to-json(%payload), :reply-to($result-inbox);
 
-        note "  📤 {$task-id} ({$wtype}) → {$subject}";
+        note "  📤 {$task-id} ({$wtype}) → {$subject} (reply: {$result-inbox})";
     }
 
-    # ═══════ STEP 3: Spawn workers for non-typed tasks only (JetStream) ═══════
-    my $generic-tasks = @subtasks.grep({ !($_<worker_type> // '') }).elems;
-    if $generic-tasks > 0 {
-        my $needed = min($generic-tasks, $max-workers.Int);
-        note "🚀 Asking spawner for {$needed} generic worker(s)...";
-        my %spawn-resp = spawn-workers($needed);
-        if %spawn-resp<ok> {
-            note "  ✅ Spawner: {(%spawn-resp<workers> // []).join(', ')}";
-            stream($sid, 'workers-ready',
-                :message("{%spawn-resp<workers>.elems} worker(s) started"),
-            );
-        } else {
-            note "  ⚠️ Spawner warning: {%spawn-resp<message> // 'unknown'}";
-        }
-    } else {
-        note "✅ All tasks routed to typed workers (no spawner needed)";
-    }
-
-    # ═══════ STEP 4: Collect results ═══════
+    # ═══════ STEP 3: Collect results ═══════
     note "⏳ Waiting for {+@result-promises} worker result(s) (60s timeout)...";
     my $all = Promise.allof(@result-promises);
     await Promise.anyof: $all, Promise.in(60);
@@ -594,99 +592,26 @@ RETRY
         }
     }
 
-    # ═══════ STEP 5: Handle results — retry with spawner if no workers ═══════
+    # ═══════ STEP 5: If no workers responded, graceful degradation (no retry) ═══════
+    # Spawner already confirmed workers were ready. If they still don't respond,
+    # something is fundamentally broken — don't loop, just degrade gracefully.
     if $done-count == 0 {
-        note "⚠️ No workers completed — requesting spawner to ensure typed workers...";
-
-        # Collect unique worker types that failed
-        my %failed-types;
-        for @subtasks -> $st {
-            my $wtype = $st<worker_type> // 'shell';
-            %failed-types{$wtype}++;
-        }
-
-        my $spawner-ok = False;
-        for %failed-types.keys -> $wtype {
-            next if $wtype eq 'factory';  # factory is a meta-worker, skip
-            my %sr = request-reply('spawner.control', to-json({ :action<ensure_typed>, :type($wtype) }));
-            if %sr<ok> {
-                note "  ✅ Spawner ensured worker type '{$wtype}': {%sr<status> // 'started'}";
-                $spawner-ok = True;
-            } else {
-                note "  ⚠️ Spawner for '{$wtype}': {%sr<error> // 'unknown error'}";
-                if %sr<reason> eq 'no_image' {
-                    note "  🏭 No image for '{$wtype}' — requesting worker-factory...";
-                    my %fr = request-reply('worker.factory.request', to-json({
-                        :prompt("Create worker type {$wtype} for executing tasks"),
-                        :spec({ :name($wtype), :description("Worker for {$wtype} tasks") }),
-                    }));
-                    if %fr<status> eq 'created' {
-                        note "  ✅ Factory created '{$wtype}' — retrying spawner...";
-                        sleep 2;
-                        my %sr2 = request-reply('spawner.control', to-json({ :action<ensure_typed>, :type($wtype) }));
-                        if %sr2<ok> { $spawner-ok = True }
-                    }
-                }
-            }
-        }
-
-        if $spawner-ok {
-            note "🔄 Spawner started workers — retrying tasks (15s timeout)...";
-            sleep 3;  # Wait for workers to connect to NATS
-
-            # Re-publish tasks (reuse the same result inbox pattern)
-            @result-promises = ();
-            for @subtasks -> $st {
-                my $task-id   = $st<id> // ('task-' ~ (^1000).pick);
-                my $wtype     = $st<worker_type> // 'shell';
-                next if $wtype eq 'factory';
-                my $result-inbox = "_INBOX.retry.{$task-id}." ~ (('a'..'z').pick xx 8).join;
-                my $result-sub = $nats.subscribe: $result-inbox, :1max-messages;
-                my $result-promise = $result-sub.supply.head.Promise.then: -> $p {
-                    my $msg = $p.result;
-                    return { :error("Worker {$task-id}: no response on retry") } unless $msg && $msg.payload;
-                    try from-json($msg.payload) // { :error("Bad result JSON") };
-                };
-                @result-promises.push: $result-promise;
-                my $subject = "worker.{$wtype}.task.{$task-id}";
-                my %payload = :id($task-id), :role($st<role>), :task($st<task>), :session-id($sid);
-                %payload<args> = $st<args> if $st<args>:exists;
-                $nats.publish: $subject, to-json(%payload), :reply-to($result-inbox);
-                note "  🔄 Retry {$task-id} → {$subject}";
-            }
-
-            my $retry-all = Promise.allof(@result-promises);
-            await Promise.anyof: $retry-all, Promise.in(15);
-            @results = $retry-all.so
-                ?? @result-promises.map(*.result)
-                !! [{ :error("Worker retry timeout after 15s") },];
-            $done-count = 0;
-            for @results -> $r {
-                $done-count++ unless $r<error>;
-            }
-            note $done-count > 0
-                ?? "  ✅ Retry: {$done-count}/{+@results} workers responded"
-                !! "  ❌ Retry also failed";
-        }
-
-        if $done-count == 0 {
-            note "⚠️ No workers completed after retry — graceful degradation";
-            my $err-msg = "Unable to process your request right now — no workers available. Please try again later.";
-            session-append-batch($sid, $seq, [
-                { :role<user>,      :content($prompt) },
-                { :role<assistant>, :content($err-msg) },
-            ]);
-            $nats.publish: $reply-to, to-json({
-                :result($err-msg),
-                :session_id($sid),
-                :subtask_count(+@subtasks),
-                :chat_id($chat-id),
-            });
-            stream($sid, 'degraded', :message("Graceful degradation: 0/{+@subtasks} workers completed after retry"));
-            note "✅ Graceful degradation response sent (session {$sid}).";
-            $tasks-done++;
-            return;
-        }
+        note "⚠️ No workers responded despite spawner confirmation — graceful degradation";
+        my $err-msg = "Unable to process your request right now — workers are not responding. Please try again.";
+        session-append-batch($sid, $seq, [
+            { :role<user>,      :content($prompt) },
+            { :role<assistant>, :content($err-msg) },
+        ]);
+        $nats.publish: $reply-to, to-json({
+            :result($err-msg),
+            :session_id($sid),
+            :subtask_count(+@subtasks),
+            :chat_id($chat-id),
+        });
+        stream($sid, 'degraded', :message("0/{+@subtasks} workers completed — graceful degradation"));
+        note "✅ Graceful degradation response sent (session {$sid}).";
+        $tasks-done++;
+        return;
     }
 
     # ═══════ STEP 6: Synthesize (with history) ═══════

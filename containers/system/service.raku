@@ -13,17 +13,36 @@ $*ERR.out-buffer = False;
 my $nats-url     = %*ENV<NATS_URL>     // 'nats://127.0.0.1:4222';
 my $service-name = %*ENV<SERVICE_NAME>  // 'worker-system';
 my $docker-sock  = %*ENV<DOCKER_SOCK>   // '/var/run/docker.sock';
+my $worker-id    = ('y' ~ (^10000).pick).Str;
 
 # ── Connect NATS ──
-note "🟡 System-Worker connecting NATS ($nats-url)...";
+note "🟡 System-Worker-{$worker-id} connecting NATS ($nats-url)...";
 my $nats = Nats.new: :servers[$nats-url];
 await $nats.start;
 $nats.connect;
-note "🟢 System-Worker connected.";
+note "🟢 System-Worker-{$worker-id} connected.";
+
+# ── Lifecycle event publisher ──
+my $lifecycle-subject = "worker.status.system.{$worker-id}";
+sub lifecycle(Str $event) {
+    $nats.publish: "{$lifecycle-subject}.{$event}",
+        to-json({ :$worker-id, :type<system>, :$event, :ts(now.Real) });
+}
+
+# ── Worker registry payload (sent from react after orchestrator taps supply) ──
+my $registry-msg = to-json({
+    :name<system>,
+    :subject('worker.system.task.>'),
+    :description('Queries Camélia system: container status, health, sessions, reconfiguration'),
+    :topics(['containers_list', 'container_detail', 'system_health', 'session_get', 'session_list', 'reconfigure']),
+});
 
 my $task-sub   = $nats.subscribe: 'worker.system.task.>';
 my $health-sub = $nats.subscribe: 'health.check.worker.system';
 note "🟢 Listening on worker.system.task.>";
+
+# ── Track activity ──
+my $last-activity = now;
 
 # ── Docker query helper (via REST API, like spawner) ──
 sub docker-api(Str $method, Str $path, Str $body?) {
@@ -269,7 +288,15 @@ sub dispatch(Str $topic, %args --> Hash) {
 }
 
 # ── React loop ──
+
 react {
+    # Publish started AFTER react is running (spawner needs time to tap supplies)
+    start {
+        sleep 0.5;
+        $nats.publish: 'worker.registry', $registry-msg;
+        lifecycle('started');
+    }
+
     whenever $task-sub.supply -> $msg {
         next unless $msg.payload;
         my $reply-to = $msg.?reply-to;
@@ -288,6 +315,8 @@ react {
         my %args  = %task<arguments> // %task<args> // {};
 
         note "🔍 System query: {$topic}";
+        $last-activity = now;
+        lifecycle('busy');
         start {
             my %resp := dispatch($topic, %args);
             %resp<worker> = $service-name;
@@ -297,6 +326,8 @@ react {
             } else {
                 note "  ✅ {$topic} done";
             }
+            $last-activity = now;
+            lifecycle('idle');
         }
     }
 
@@ -304,6 +335,8 @@ react {
         if $msg.?reply-to {
             $nats.publish: $msg.reply-to, to-json({
                 :status<ok>, :service<worker-system>,
+                :$worker-id,
+                :idle_seconds((now - $last-activity).Int),
                 :topics(['containers_list', 'container_detail', 'system_health', 'session_get', 'session_list', 'reconfigure']),
             });
         }

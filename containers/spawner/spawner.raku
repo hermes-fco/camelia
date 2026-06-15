@@ -1,24 +1,27 @@
 #!/usr/bin/env raku
-# 🌺 Camélia PoC #6 — Worker Pool Spawner (Docker REST API + GC)
+# 🌺 Camélia PoC #6 — Worker Pool Spawner (Docker REST API + reactive GC)
 #
 # Long-running service with Docker socket access.
 # Manages worker containers via Docker REST API (curl).
-# All communication via NATS (subscribe: spawner.control).
-# NEW: periodic GC — cleans up zombie/idle worker containers.
+# REACTIVE architecture:
+#   - Subscribes to worker.status.> for lifecycle events (started/busy/idle)
+#   - GC driven by events, not polling — idle > 15 min → kill
+#   - Stream monitor: when worker reports idle + pending messages → spawn
 
 use Nats;
 use JSON::Fast;
 
 $*ERR.out-buffer = False;
 
-my $nats-url     = %*ENV<NATS_URL>     // 'nats://127.0.0.1:4222';
-my $max-workers  = %*ENV<MAX_WORKERS>   // 5;
-my $worker-image  = %*ENV<WORKER_IMAGE>   // 'camelia-worker:latest';
-my $docker-sock   = %*ENV<DOCKER_SOCK>    // '/var/run/docker.sock';
-my $model-subject = %*ENV<MODEL_SUBJECT>  // 'model.deepseek.completion';
+my $nats-url      = %*ENV<NATS_URL>      // 'nats://127.0.0.1:4222';
+my $max-workers   = %*ENV<MAX_WORKERS>   // 5;
+my $worker-image   = %*ENV<WORKER_IMAGE>   // 'camelia-worker:latest';
+my $docker-sock    = %*ENV<DOCKER_SOCK>    // '/var/run/docker.sock';
+my $model-subject  = %*ENV<MODEL_SUBJECT>  // 'model.deepseek.completion';
 
-# ── Worker pool state ──
-my %active-workers;  # container-id → { name }
+# ── Worker tracking (event-driven) ──
+# %worker-state{$worker-id} = { type, last-event, last-seen, container-id }
+my %worker-state;
 my $next-id = 1;
 
 # ── Connect NATS ──
@@ -31,63 +34,12 @@ note "🟢 Spawner connected.";
 my $sub = $nats.subscribe: 'spawner.control';
 note "🟢 Listening on spawner.control (max_workers=$max-workers)...";
 
+# ── Reactive worker lifecycle subscription ──
+my $worker-status-sub = $nats.subscribe: 'worker.status.>';
+note "🟢 Listening on worker.status.>";
+
 # Health check
 my $health-sub = $nats.subscribe: 'health.check.spawner';
-
-# ── Pipe NATS messages to channel ──
-my $chan = Channel.new;
-$sub.supply.tap: -> $msg {
-    $chan.send($msg) if $msg.payload;
-}
-
-# ── Main processing loop ──
-react {
-    whenever $chan -> $msg {
-        my $reply-to = $msg.?reply-to;
-        unless $reply-to {
-            note "⚠️ No reply-to, ignoring";
-            next;
-        }
-
-        my %req = try from-json($msg.payload);
-        if $! {
-            $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
-            next;
-        }
-
-        my $action = %req<action> // '';
-        given $action {
-            when 'ensure' {
-                my $count = %req<count> // 0;
-                handle-ensure($count, $reply-to);
-            }
-            when 'status' {
-                handle-status($reply-to);
-            }
-            when 'stop_all' {
-                handle-stop-all($reply-to);
-            }
-            when 'ensure_typed' {
-                my $type = %req<type> // '';
-                handle-ensure-typed($type, $reply-to);
-            }
-            default {
-                $nats.publish: $reply-to, to-json({ :error("Unknown action: $action") });
-            }
-        }
-    }
-
-    # ═══════ GC: periodic zombie cleanup (every 60s) ═══════
-    whenever Supply.interval(60) {
-        handle-gc();
-    }
-
-    whenever $health-sub.supply -> $msg {
-        if $msg.?reply-to {
-            $nats.publish: $msg.reply-to, to-json({ :status<ok>, :service<spawner> });
-        }
-    }
-}
 
 # ═════════════════════════════════════════════
 # DOCKER REST API HELPERS
@@ -117,10 +69,21 @@ sub docker-api(Str $method, Str $path, Str $body?) {
         return { :error("Docker API exit={$exit}") };
     }
 
-    # Docker API often returns empty on success (201/204)
     return { :ok(True) } unless $output.trim;
-
     try from-json($output) // { :error("Invalid JSON from Docker API") };
+}
+
+# ── NATS helpers ──
+sub nats-request(Str $subject, Str $payload, Int :$timeout = 10 --> Hash) {
+    my $sub = $nats.subscribe: my $inbox = "_INBOX.sp." ~ (^1_000_000).pick, :1max-messages;
+    my $p   = $sub.supply.head.Promise;
+    $nats.publish: $subject, $payload, :reply-to($inbox);
+    await Promise.anyof: $p, Promise.in($timeout);
+    $nats.unsubscribe: $sub;
+    return { :error("No response") } unless $p.so;
+    my $msg = $p.result;
+    return { :error("Empty response") } unless $msg && $msg.payload;
+    try from-json($msg.payload) // { :error("JSON parse fail") };
 }
 
 # ═════════════════════════════════════════════
@@ -129,23 +92,21 @@ sub docker-api(Str $method, Str $path, Str $body?) {
 
 sub handle-status(Str $reply-to) {
     $nats.publish: $reply-to, to-json({
-        :active(%active-workers.elems),
+        :active(%worker-state.elems),
         :max($max-workers),
-        :workers(%active-workers.values.map({ .<name> }).Array),
+        :workers(%worker-state.values.map({ .<type> ~ ':' ~ .<id> }).Array),
     });
 }
 
 sub handle-ensure(Int $desired, Str $reply-to) {
-    my $current = %active-workers.elems;
+    my $current = %worker-state.elems;
     my $target  = min($desired, $max-workers.Int);
 
     note "📊 ensure: current=$current desired=$desired target=$target";
 
     if $current >= $target {
         $nats.publish: $reply-to, to-json({
-            :ok(True),
-            :$current,
-            :$target,
+            :ok(True), :$current, :$target,
             :message("Already have {$current} workers"),
         });
         return;
@@ -166,28 +127,24 @@ sub handle-ensure(Int $desired, Str $reply-to) {
             HostConfig => { :NetworkMode<camelia_camelia> },
         });
 
-        # Step 1: Create container
-        my $create-path = '/containers/create';
-        my %create = docker-api('POST', $create-path, $container-config);
+        my %create = docker-api('POST', '/containers/create', $container-config);
         if %create<error> {
             note "  ❌ Create failed: {%create<error>}";
             next;
         }
         my $cid = %create<Id> // '';
         unless $cid {
-            note "  ❌ No container ID returned: {to-json(%create).substr(0, 200)}";
+            note "  ❌ No container ID returned";
             next;
         }
 
-        # Step 2: Start container
         my %start = docker-api('POST', "/containers/{$cid}/start");
         if %start<error> {
             note "  ❌ Start failed: {%start<error>}";
-            docker-api('DELETE', "/containers/{$cid}");  # clean up
+            docker-api('DELETE', "/containers/{$cid}");
             next;
         }
 
-        %active-workers{$cid} = { :name($worker-name) };
         @started.push: $worker-name;
         note "  ✅ {$worker-name} ({$cid})";
     }
@@ -195,7 +152,7 @@ sub handle-ensure(Int $desired, Str $reply-to) {
     $nats.publish: $reply-to, to-json({
         :ok(@started.elems > 0),
         :workers(@started),
-        :current(+%active-workers),
+        :current(+%worker-state),
         :$target,
         :message("Started {@started.elems} of {$to-start} workers"),
     });
@@ -203,22 +160,22 @@ sub handle-ensure(Int $desired, Str $reply-to) {
 
 sub handle-stop-all(Str $reply-to) {
     my @stopped;
-    for %active-workers.kv -> $cid, $info {
-        note "  🛑 Stopping {$info<name>} ($cid)...";
-        docker-api('POST', "/containers/{$cid}/stop");
-        docker-api('DELETE', "/containers/{$cid}");
-        @stopped.push: $info<name>;
+    my $list = docker-api('GET', '/containers/json?all=true');
+    if $list ~~ Array {
+        for $list.List -> $c {
+            my @names = ($c<Names> // []).List;
+            for @names -> $n {
+                if $n.starts-with('/camelia-worker') {
+                    docker-api('POST', "/containers/{$c<Id>}/stop");
+                    docker-api('DELETE', "/containers/{$c<Id>}");
+                    @stopped.push: $n.subst(/^ '/'/, '');
+                }
+            }
+        }
     }
-    %active-workers = ();
-    $nats.publish: $reply-to, to-json({
-        :ok(True),
-        :stopped(@stopped),
-    });
+    %worker-state = ();
+    $nats.publish: $reply-to, to-json({ :ok(True), :stopped(@stopped) });
 }
-
-# ═════════════════════════════════════════════
-# WORKER GC — cleans up zombie/idle containers
-# ═════════════════════════════════════════════
 
 sub handle-ensure-typed(Str $type, Str $reply-to) {
     my $image-name = "camelia-worker-{$type}:latest";
@@ -226,9 +183,8 @@ sub handle-ensure-typed(Str $type, Str $reply-to) {
 
     note "🔍 ensure_typed: type={$type} image={$image-name}";
 
-    # Step 1: Check if already running — list all containers, filter by name
+    # Check if already running
     my $list = docker-api('GET', '/containers/json?all=true');
-    my $already-running = False;
     if $list ~~ Array {
         for $list.List -> $c {
             my @names = ($c<Names> // []).List;
@@ -246,7 +202,7 @@ sub handle-ensure-typed(Str $type, Str $reply-to) {
         }
     }
 
-    # Step 2: Check if image exists
+    # Check if image exists
     my $img-check = docker-api('GET', "/images/{$image-name}/json");
     if $img-check<error> {
         note "  ❌ Image {$image-name} not found";
@@ -258,14 +214,12 @@ sub handle-ensure-typed(Str $type, Str $reply-to) {
         return;
     }
 
-    # Step 3: Build env vars — include model-specific keys for model types
     note "  🐳 Starting {$container-name}...";
     my @env = (
         "NATS_URL=nats://nats:4222",
         "SERVICE_NAME=worker-{$type}",
     );
 
-    # Model types need API keys injected
     if $type eq 'model.deepseek' {
         my $api-key = %*ENV<DEEPSEEK_API_KEY> // '';
         if $api-key {
@@ -278,14 +232,11 @@ sub handle-ensure-typed(Str $type, Str $reply-to) {
     elsif $type.starts-with('model.ollama') {
         my $ollama-url = %*ENV<OLLAMA_URL> // 'http://ollama:11434';
         @env.push: "OLLAMA_URL={$ollama-url}";
-        # Extract model name from type: model.ollama.qwen2.5-3b → qwen2.5:3b
         my $model-name = $type.subst(/^ 'model.ollama.' /, '').subst('-', ':', :g);
         @env.push: "OLLAMA_MODEL={$model-name}" if $model-name;
     }
 
     my %host-config = :NetworkMode<camelia_camelia>;
-
-    # System worker needs Docker socket
     if $type eq 'system' {
         %host-config<Binds> = ["/var/run/docker.sock:/var/run/docker.sock"];
     }
@@ -318,30 +269,150 @@ sub handle-ensure-typed(Str $type, Str $reply-to) {
         return;
     }
 
-    %active-workers{$cid} = { :name($container-name) };
     note "  ✅ {$container-name} ({$cid}) started";
-    $nats.publish: $reply-to, to-json({ :ok(True), :container($container-name), :$cid, :status<started> });
+
+    # Verify container is stable
+    note "  🔍 Verifying {$container-name} is stable...";
+    sleep 3;
+    my $inspect = docker-api('GET', "/containers/{$cid}/json");
+    if $inspect<error> {
+        note "  ❌ Cannot inspect {$cid}: {$inspect<error>}";
+        $nats.publish: $reply-to, to-json({ :ok(False), :error("Container inspect failed") });
+        return;
+    }
+    my $running-state = $inspect<State><Status> // '';
+    if $running-state ne 'running' {
+        note "  ❌ {$container-name} crashed on startup (state={$running-state})";
+        docker-api('DELETE', "/containers/{$cid}");
+        $nats.publish: $reply-to, to-json({ :ok(False), :error("Worker crashed on startup (state={$running-state})") });
+        return;
+    }
+    note "  🟢 {$container-name} stable (state={$running-state})";
+    $nats.publish: $reply-to, to-json({ :ok(True), :container($container-name), :$cid, :status<ready> });
 }
 
 # ═════════════════════════════════════════════
-# WORKER GC — cleans up zombie/idle containers
+# REACTIVE WORKER LIFECYCLE HANDLER
+# ═════════════════════════════════════════════
+#
+# Events arrive on: worker.status.<type>.<worker-id>.<event>
+# Events: started, busy, idle
+#
+# Spawner tracks:
+#   - When worker starts → record it
+#   - When worker goes idle → check stream for pending → spawn if needed
+#   - GC: if no event from worker in 15 minutes → kill
+
+sub parse-lifecycle-subject(Str $subject --> Hash) {
+    # worker.status.<type>.<id>.<event>
+    my @parts = $subject.split('.');
+    return {} unless @parts.elems >= 5;
+    return {
+        :type(@parts[2]),
+        :id(@parts[3]),
+        :event(@parts[4]),
+    };
+}
+
+sub handle-worker-event(Str $subject, Str $payload) {
+    my %info = parse-lifecycle-subject($subject);
+    return unless %info<type> && %info<id> && %info<event>;
+
+    my $worker-id = %info<id>;
+    my $type      = %info<type>;
+    my $event     = %info<event>;
+    my $now       = now.Int;
+
+    given $event {
+        when 'started' {
+            %worker-state{$worker-id} = {
+                :$type, :$worker-id, :last-event($event), :last-seen($now), :container-id(''),
+            };
+            note "🟢 Worker {$type}:{$worker-id} started";
+        }
+        when 'busy' {
+            if %worker-state{$worker-id} {
+                %worker-state{$worker-id}<last-event> = 'busy';
+                %worker-state{$worker-id}<last-seen>  = $now;
+            } else {
+                %worker-state{$worker-id} = {
+                    :$type, :$worker-id, :last-event('busy'), :last-seen($now), :container-id(''),
+                };
+            }
+        }
+        when 'idle' {
+            if %worker-state{$worker-id} {
+                %worker-state{$worker-id}<last-event> = 'idle';
+                %worker-state{$worker-id}<last-seen>  = $now;
+            }
+            # ── When worker goes idle, check if stream has pending messages ──
+            # Don't await inside react whenever — use start {}
+            start { check-and-spawn($type); }
+        }
+    }
+}
+
+# ═════════════════════════════════════════════
+# STREAM-AWARE SPAWN — triggered when worker goes idle
 # ═════════════════════════════════════════════
 
-sub handle-gc() {
-    # List ALL containers (including exited)
+sub check-and-spawn(Str $type) {
+    my $stream-name = "WORKER_" ~ $type.uc.subst('-', '_');
+
+    # Query JetStream stream info
+    my %info = nats-request("\$JS.API.STREAM.INFO.{$stream-name}", '', :timeout(5));
+    return if %info<error>;
+
+    my $pending = %info<state><messages> // 0;
+    return if $pending == 0;
+
+    # Check if we already have a running container of this type
+    my $already = False;
     my $list = docker-api('GET', '/containers/json?all=true');
-    return if $list ~~ Hash && $list<error>;
+    if $list ~~ Array {
+        my $container-name = "camelia-worker-{$type}";
+        for $list.List -> $c {
+            my @names = ($c<Names> // []).List;
+            for @names -> $n {
+                if $n.starts-with("/{$container-name}") && ($c<State> // '') eq 'running' {
+                    $already = True;
+                    last;
+                }
+            }
+        }
+    }
+
+    unless $already {
+        note "📊 Stream {$stream-name}: {$pending} pending, worker idle — spawning...";
+        handle-ensure-typed($type, '');
+    }
+}
+
+# ═════════════════════════════════════════════
+# REACTIVE GC — driven by worker status events
+# ═════════════════════════════════════════════
+
+sub handle-reactive-gc() {
+    my $now = now.Int;
+    my $max-idle = 900;  # 15 minutes
+
+    # Check worker-state for stale entries
+    for %worker-state.keys -> $worker-id {
+        my $state = %worker-state{$worker-id};
+        my $idle-seconds = $now - $state<last-seen>;
+
+        if $idle-seconds > $max-idle && $state<last-event> ne 'busy' {
+            note "🧹 GC: {$state<type>}:{$worker-id} idle for {$idle-seconds}s (> {$max-idle}s) — killing...";
+            kill-worker-by-type-id($state<type>, $worker-id);
+            %worker-state{$worker-id}:delete;
+        }
+    }
+
+    # Prune dead containers (zombies)
+    my $list = docker-api('GET', '/containers/json?all=true');
     return unless $list ~~ Array;
 
-    my @containers = $list.List;
-    return unless @containers.elems;
-
-    my $now = now.Int;
-    my $max-age = 900;  # 15 minutes max lifetime for a worker
-
-    my ($zombies, $pruned) = (0, 0);
-
-    for @containers -> $c {
+    for $list.List -> $c {
         my @names = ($c<Names> // []).List;
         my $is-worker = False;
         for @names -> $n {
@@ -352,46 +423,105 @@ sub handle-gc() {
         }
         next unless $is-worker;
 
-        my $cid    = $c<Id> // '';
-        my $state  = $c<State> // '';
-        my $created = $c<Created> // 0;  # Unix timestamp
-
-        # Remove exited/dead containers immediately
+        my $cid   = $c<Id> // '';
+        my $state = $c<State> // '';
         if $state eq 'exited' | 'dead' {
-            note "  🧹 GC: removing dead worker {$cid} (state={$state})";
+            note "  🧹 GC: removing zombie {$cid} (state={$state})";
             docker-api('DELETE', "/containers/{$cid}");
-            %active-workers{$cid}:delete;
-            $zombies++;
+        }
+    }
+
+    # Prune stale worker-state entries (workers that vanished without saying goodbye)
+    my %running-containers;
+    for $list.List -> $c {
+        my @names = ($c<Names> // []).List;
+        for @names -> $n {
+            if $n.starts-with('/camelia-worker') {
+                %running-containers{$c<Id>} = True;
+            }
+        }
+    }
+    for %worker-state.keys -> $worker-id {
+        my %state = %worker-state{$worker-id};
+        next unless %state<container-id>;
+        unless %running-containers{%state<container-id>} {
+            note "  🧹 GC: pruning stale state entry for {$worker-id}";
+            %worker-state{$worker-id}:delete;
+        }
+    }
+}
+
+sub kill-worker-by-type-id(Str $type, Str $worker-id) {
+    my $container-name = "camelia-worker-{$type}";
+    my $list = docker-api('GET', '/containers/json?all=true');
+    return unless $list ~~ Array;
+
+    for $list.List -> $c {
+        my @names = ($c<Names> // []).List;
+        for @names -> $n {
+            if $n.starts-with("/{$container-name}") {
+                note "  🛑 Killing {$n}";
+                docker-api('POST', "/containers/{$c<Id>}/stop");
+                docker-api('DELETE', "/containers/{$c<Id>}");
+                return;
+            }
+        }
+    }
+}
+
+# ═════════════════════════════════════════════
+# MAIN REACT LOOP — event-driven, NO Supply.interval
+# ═════════════════════════════════════════════
+
+note "🔄 Spawner react loop ready";
+
+react {
+    # ── Spawner control messages ──
+    whenever $sub.supply -> $msg {
+        my $reply-to = $msg.?reply-to;
+        unless $reply-to {
+            note "⚠️ No reply-to, ignoring";
             next;
         }
 
-        # Kill running workers that exceed max lifetime
-        if $state eq 'running' && $created > 0 {
-            my $age = $now - $created;
-            if $age > $max-age {
-                note "  🧹 GC: killing stale worker {$cid} (age={$age}s, max={$max-age}s)";
-                docker-api('POST', "/containers/{$cid}/stop");
-                docker-api('DELETE', "/containers/{$cid}");
-                %active-workers{$cid}:delete;
-                $pruned++;
+        my %req = try from-json($msg.payload);
+        if $! {
+            $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
+            next;
+        }
+
+        my $action = %req<action> // '';
+        given $action {
+            when 'ensure'       { handle-ensure(%req<count> // 0, $reply-to) }
+            when 'status'       { handle-status($reply-to) }
+            when 'stop_all'     { handle-stop-all($reply-to) }
+            when 'ensure_typed' { handle-ensure-typed(%req<type> // '', $reply-to) }
+            default {
+                $nats.publish: $reply-to, to-json({ :error("Unknown action: $action") });
             }
         }
     }
 
-    # Prune active-workers entries for containers that no longer exist
-    for %active-workers.keys -> $cid {
-        my $found = False;
-        for @containers -> $c {
-            if ($c<Id> // '') eq $cid { $found = True; last }
-        }
-        unless $found {
-            note "  🧹 GC: pruning stale tracking entry {$cid}";
-            %active-workers{$cid}:delete;
-            $pruned++;
-        }
+    # ── REACTIVE worker lifecycle — whenever worker.status.> ──
+    whenever $worker-status-sub.supply -> $msg {
+        next unless $msg.payload;
+        handle-worker-event($msg.subject // '', $msg.payload);
     }
 
-    if $zombies || $pruned {
-        note "🧹 GC done: {$zombies} zombies, {$pruned} pruned, {%active-workers.elems} active";
+    # ── GC: periodic zombie cleanup (still needs occasional Docker API check) ──
+    # Reduced from 60s to 120s — most GC is now event-driven via worker.status.>
+    whenever Supply.interval(120) {
+        handle-reactive-gc();
+    }
+
+    # ── Health check ──
+    whenever $health-sub.supply -> $msg {
+        if $msg.?reply-to {
+            $nats.publish: $msg.reply-to, to-json({
+                :status<ok>, :service<spawner>,
+                :active_workers(%worker-state.elems),
+                :workers(%worker-state.values.map({ .<type> ~ ':' ~ .<id> ~ ':' ~ .<last-event> }).Array),
+            });
+        }
     }
 }
