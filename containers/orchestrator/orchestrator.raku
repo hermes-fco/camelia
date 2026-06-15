@@ -22,7 +22,7 @@ my $decomp-system = q:to/END/;
 You are a task orchestrator. Break down complex tasks into parallel subtasks.
 
 Available worker types:
-- worker.shell — executes a SINGLE bash one-liner. The 'task' field MUST be a valid bash command (not a description). Chain with && or ; for multiple steps.
+- worker.shell — executes a SINGLE bash one-liner. The 'task' field MUST be a valid bash command (not a description). Chain with && or ; for multiple steps. Use ONLY for simple commands (echo, date, grep, ls, cat, wc). Do NOT use for web/HTTP tasks.
 - worker.system — queries the Camélia system. The 'task' field is a TOPIC NAME (not a shell command). Available topics:
   • containers_list — list all Camélia containers with state/status
   • container_detail — args: {"name":"camelia-<name>"} — detailed info on one container
@@ -30,6 +30,7 @@ Available worker types:
   • session_get — args: {"session_id":"sess-xxx"} — get session data and history
   • session_list — list all active session IDs
   • reconfigure — args: {"container":"camelia-orchestrator", "env":{"MAX_WORKERS":"5"}} — change env vars and restart container
+- worker.web-browser — fetches URLs, renders JavaScript pages, extracts readable text from HTML. Use for ANY web/HTTP task: fetching pages, scraping content, calling APIs, downloading data. The 'task' field is a URL or shell command (curl with -L for redirects, or curl -s -o output). Always prefer this over worker.shell for HTTP tasks.
 
 The system containers are: camelia-nats, camelia-orchestrator, camelia-spawner,
 camelia-worker-model-deepseek, camelia-tool-executor, camelia-session-store,
@@ -477,6 +478,97 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?, Str $chat-id?) {
     stream($sid, 'results-collected',
         :message("{$done-count}/{+@results} worker results collected"),
     );
+
+    # ═══════ STEP 4b: Smart retry — analyze failures, try alternative approaches ═══════
+    # Only retry if some workers succeeded (so system is alive) but some failed
+    if $done-count > 0 && $done-count < +@results && +@results <= 3 {
+        my $retry-attempt = 0;
+        my $max-smart-retries = 2;
+
+        while $retry-attempt < $max-smart-retries && $done-count < +@results {
+            $retry-attempt++;
+            note "🔄 Smart retry #{$retry-attempt} — analyzing failures...";
+
+            # Build error context
+            my $error-context = '';
+            for @results.kv -> $i, $r {
+                next unless $r<error>;
+                $error-context ~= "Task {$i}: FAILED — {$r<error>}\n";
+            }
+
+            # Ask LLM for alternative approaches
+            my @retry-msgs = (
+                { :role<system>, :content(q:to/RETRY/) },
+You are a task repair agent. Some workers failed. Analyze the errors and create
+alternative subtasks to accomplish the original goal. Consider:
+- Using a different worker type (web-browser instead of shell for HTTP)
+- Breaking the task into smaller steps
+- Using a different URL or approach
+- Adding error handling (--fail, -L, retries)
+
+Output ONLY a JSON array of new subtask objects, or [] if no fix is possible.
+RETRY
+            );
+            @retry-msgs.push: { :role<user>, :content(
+                "Original request: $prompt\n\n" ~
+                "Failed tasks:\n{$error-context}\n\n" ~
+                "Create alternative subtasks to recover."
+            )};
+
+            my %rr-resp = call-model(@retry-msgs, :temperature(0.3));
+            next if %rr-resp<error>;
+
+            my $rr-raw = %rr-resp<choices>[0]<message><content> // '';
+            $rr-raw ~~ s/^ .*? '['/[/;
+            $rr-raw ~~ s/']' .*? $/]/;
+            my @retry-tasks = try from-json($rr-raw);
+            next if $! || @retry-tasks.elems == 0;
+
+            note "  💡 Generated {@retry-tasks.elems} alternative subtask(s)";
+
+            # Execute retry tasks
+            my @retry-promises;
+            for @retry-tasks -> $st {
+                my $task-id = $st<id> // ('retry-' ~ $retry-attempt ~ '-' ~ (^1000).pick);
+                my $wtype   = $st<worker_type> // 'shell';
+                my $result-inbox = "_INBOX.smart-retry.{$task-id}." ~ (('a'..'z').pick xx 8).join;
+
+                my $result-sub = $nats.subscribe: $result-inbox, :1max-messages;
+                my $result-promise = $result-sub.supply.head.Promise.then: -> $p {
+                    my $msg = $p.result;
+                    return { :error("Retry {$task-id}: no response") } unless $msg && $msg.payload;
+                    try from-json($msg.payload) // { :error("Retry {$task-id}: Bad JSON") };
+                };
+                @retry-promises.push: $result-promise;
+
+                my $subject = $wtype eq 'factory'
+                    ?? 'worker.factory.request'
+                    !! "worker.{$wtype}.task.{$task-id}";
+                my %payload = :id($task-id), :role("retry-{$retry-attempt}-" ~ ($st<role> // '')), :task($st<task>), :session-id($sid);
+                %payload<args> = $st<args> if $st<args>:exists;
+                $nats.publish: $subject, to-json(%payload), :reply-to($result-inbox);
+                note "  🔄 Smart retry {$task-id} ({$wtype}) → {$subject}: {$st<task>.substr(0, 80)}";
+            }
+
+            my $retry-all = Promise.allof(@retry-promises);
+            await Promise.anyof: $retry-all, Promise.in(30);
+            my @retry-results = $retry-all.so
+                ?? @retry-promises.map(*.result)
+                !! [{ :error("Smart retry timeout") },];
+
+            my $retry-ok = 0;
+            for @retry-results -> $r {
+                if $r<error> {
+                    note "    ❌ retry: {$r<error>}";
+                } else {
+                    $retry-ok++;
+                    @results.push: $r;
+                }
+            }
+            $done-count += $retry-ok;
+            note "  ✅ Smart retry #{$retry-attempt}: {$retry-ok}/{+@retry-tasks} recovered, total done: {$done-count}/{+@results}";
+        }
+    }
 
     # ═══════ STEP 5: Handle results — retry with spawner if no workers ═══════
     if $done-count == 0 {
