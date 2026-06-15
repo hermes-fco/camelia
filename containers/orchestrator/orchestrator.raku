@@ -251,11 +251,11 @@ sub setup-jetstream() {
 # REQUEST-REPLY — uses $nats.request (native nats.raku)
 # ═════════════════════════════════════════════
 
-sub request-reply(Str $subject, Str $payload --> Hash) {
+sub request-reply(Str $subject, Str $payload, Int :$timeout = 120 --> Hash) {
     my $supply = $nats.request: $subject, $payload;
     my $p = $supply.head.Promise;
 
-    await Promise.anyof: $p, Promise.in(120);
+    await Promise.anyof: $p, Promise.in($timeout);
 
     my %result = do if $p.so {
         my $msg = $p.result;
@@ -401,7 +401,31 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?, Str $chat-id?) {
         :subtask_count(+@subtasks),
     );
 
-    # ═══════ STEP 2: Publish tasks to typed workers (direct NATS request-reply) ═══════
+    # ═══════ STEP 2: Ensure ALL needed worker types exist (proactive spawn) ═══════
+    my %needed-types;
+    for @subtasks -> $st {
+        my $wtype = $st<worker_type> // 'shell';
+        %needed-types{$wtype}++ unless $wtype eq 'factory';
+    }
+
+    my $spawned-any = False;
+    for %needed-types.keys -> $wtype {
+        note "🔍 Ensuring worker type '{$wtype}' exists...";
+        my %sr = request-reply('spawner.control',
+            to-json({ :action<ensure_typed>, :type($wtype) }),
+            :timeout(10));
+        if %sr<ok> {
+            note "  ✅ Spawner '{$wtype}': {%sr<status> // 'ready'}";
+            $spawned-any = True;
+        } else {
+            note "  ⚠️ Spawner '{$wtype}': {%sr<error> // 'no response'}";
+        }
+    }
+    if $spawned-any {
+        sleep 2;  # Let workers connect to NATS
+    }
+
+    # ═══════ STEP 3: Publish tasks to typed workers (direct NATS request-reply) ═══════
     note "📤 Publishing {+@subtasks} tasks to typed workers...";
 
     my @result-promises;

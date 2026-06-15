@@ -163,7 +163,7 @@ sub handle-ensure(Int $desired, Str $reply-to) {
             :Image($worker-image),
             :Hostname($worker-name),
             :Env(["NATS_URL=nats://nats:4222", "MODEL_SUBJECT={$model-subject}"]),
-            HostConfig => { :NetworkMode<camelia_camelia>, RestartPolicy => { :Name<always> } },
+            HostConfig => { :NetworkMode<camelia_camelia> },
         });
 
         # Step 1: Create container
@@ -283,7 +283,7 @@ sub handle-ensure-typed(Str $type, Str $reply-to) {
         @env.push: "OLLAMA_MODEL={$model-name}" if $model-name;
     }
 
-    my %host-config = :NetworkMode<camelia_camelia>, RestartPolicy => { :Name<always> };
+    my %host-config = :NetworkMode<camelia_camelia>;
 
     # System worker needs Docker socket
     if $type eq 'system' {
@@ -337,37 +337,20 @@ sub handle-gc() {
     return unless @containers.elems;
 
     my $now = now.Int;
-    my $max-age = 900;  # 15 minutes max lifetime for an ephemeral worker
-
-    # Persistent workers — never GC'd (they're long-lived infrastructure)
-    my %persistent = set <
-        camelia-worker-shell
-        camelia-worker-system
-        camelia-worker-factory
-        camelia-worker-web-browser
-        camelia-worker-api-time
-        camelia-worker-raku-compile
-    >;
+    my $max-age = 900;  # 15 minutes max lifetime for a worker
 
     my ($zombies, $pruned) = (0, 0);
 
     for @containers -> $c {
         my @names = ($c<Names> // []).List;
         my $is-worker = False;
-        my $worker-name = '';
         for @names -> $n {
             if $n.starts-with('/camelia-worker') {
                 $is-worker = True;
-                $worker-name = $n.subst(/^ '/'/, '');
                 last;
             }
         }
         next unless $is-worker;
-
-        # Skip persistent workers — they're infrastructure, not ephemeral
-        if %persistent{$worker-name} {
-            next;
-        }
 
         my $cid    = $c<Id> // '';
         my $state  = $c<State> // '';
