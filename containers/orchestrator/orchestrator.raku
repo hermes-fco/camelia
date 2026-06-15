@@ -43,9 +43,14 @@ you need procedural knowledge. Available skills:
   • docker-container-management — manage Camelia Docker containers
   • container-health-overview — full system health check procedure
 
-Given a user request — and optionally conversation history — decompose it into 2-3 INDEPENDENT subtasks that can be executed in parallel by worker agents.
+Given a user request — and optionally conversation history — decide if it needs tool calls or can be answered directly.
 
-Output ONLY a JSON array of subtask objects:
+**If the request is conversational** (greetings, chitchat, emotional support, follow-up questions that don't need external data), output an EMPTY array: `[]`
+
+**If the request requires action** (shell commands, system queries, container management), decompose it into 1-3 INDEPENDENT subtasks that can be executed by worker agents.
+
+Output ONLY a JSON array (empty or with subtask objects):
+[]
 [
   {
     "id": "task-1",
@@ -279,6 +284,54 @@ sub spawn-workers(Int $count --> Hash) {
     request-reply('spawner.control', to-json({ :action<ensure>, :$count }));
 }
 
+sub synthesize-and-respond(Str $prompt, Str $reply-to, Str $sid, Int $seq,
+                            Str $chat-id, @history, @subtasks --> Nil) {
+    note "🧠 Direct synthesis (conversational)...";
+    stream($sid, 'synthesizing', :message("Generating direct response..."));
+
+    my @synth-msgs = (
+        { :role<system>, :content($synth-system ~ "\n\nSession ID: {$sid}") },
+    );
+    for @history -> $entry {
+        @synth-msgs.push: $entry;
+    }
+    @synth-msgs.push: {
+        :role<user>,
+        :content("Respond directly to this message: {$prompt}"),
+    };
+
+    my %s-resp = call-model(@synth-msgs);
+    if %s-resp<error> {
+        my $err = "Synthesis failed: {%s-resp<error>}";
+        $nats.publish: $reply-to, to-json({ :error($err), :chat_id($chat-id) });
+        stream($sid, 'error', :message($err));
+        return;
+    }
+
+    my $final = %s-resp<choices>[0]<message><content> // '';
+
+    session-append-batch($sid, $seq, [
+        { :role<user>,      :content($prompt) },
+        { :role<assistant>, :content($final) },
+    ]);
+
+    $nats.publish: $reply-to, to-json({
+        :result($final),
+        :session_id($sid),
+        :subtask_count(0),
+        :chat_id($chat-id),
+        :mode<direct>,
+    });
+
+    stream($sid, 'done',
+        :message("Direct response ready"),
+        :result($final),
+        :subtask_count(0),
+    );
+
+    note "✅ Direct response sent (session {$sid}).";
+}
+
 # ═════════════════════════════════════════════
 # PROCESSING LOGIC
 # ═════════════════════════════════════════════
@@ -321,10 +374,19 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?, Str $chat-id?) {
     $raw ~~ s/']' .*? $/]/;
 
     my @subtasks = try from-json($raw);
-    if $! || @subtasks.elems == 0 {
+    if $! {
         my $err = "Failed to parse subtasks: $!";
         $nats.publish: $reply-to, to-json({ :error($err), :chat_id($chat-id) });
         stream($sid, 'error', :message($err));
+        return;
+    }
+
+    # Empty subtasks = conversational, no tools needed — go direct to synthesis
+    if @subtasks.elems == 0 {
+        note "💬 Conversational — no subtasks, direct synthesis";
+        stream($sid, 'decomposed', :message("Conversational — direct response"), :subtask_count(0));
+        synthesize-and-respond($prompt, $reply-to, $sid, $seq, $chat-id, @history, []);
+        $tasks-done++;
         return;
     }
 
