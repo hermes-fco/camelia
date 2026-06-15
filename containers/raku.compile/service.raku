@@ -26,7 +26,7 @@ $nats.connect;
 note "🟢 raku.compile connected.";
 
 # Subscribe to typed tasks
-my $task-sub = $nats.subscribe: 'raku.compile.>';
+my $task-sub = $nats.subscribe: 'worker.raku-compile.task.>';
 note "🟢 Listening on raku.compile.>";
 
 # Health check

@@ -26,7 +26,7 @@ $nats.connect;
 note "🟢 api.time connected.";
 
 # Subscribe to typed tasks
-my $task-sub = $nats.subscribe: 'time.now.>';
+my $task-sub = $nats.subscribe: 'worker.api-time.task.>';
 note "🟢 Listening on time.now.>";
 
 # Health check

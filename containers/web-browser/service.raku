@@ -17,7 +17,7 @@ await $nats.start;
 $nats.connect;
 note "🟢 web.browser connected.";
 
-my $task-sub   = $nats.subscribe: 'web.browser.>';
+my $task-sub   = $nats.subscribe: 'worker.web-browser.task.>';
 my $health-sub = $nats.subscribe: 'health.check.web.browser';
 note "🟢 Listening on web.browser.>";
 
@@ -166,6 +166,26 @@ react {
 }
 
 sub handle-task(%task --> Hash) {
+    # If no 'action' but has 'task', auto-detect: URLs → extract, commands → shell
+    if !%task<action> && %task<task> {
+        my $cmd = %task<task>;
+        if $cmd.contains('https://') || $cmd.contains('http://') {
+            # Extract URL and auto-extract (fetch + strip HTML)
+            if $cmd ~~ /(https? '://' \S+)/ {
+                %task<url> = $0.Str;
+                %task<action> = 'extract';
+            }
+        }
+        # If still no action (URL regex failed or no URL found), run as shell
+        unless %task<action> {
+            my $proc = Proc::Async.new('sh', '-c', $cmd);
+            my ($out, $err) = ('', '');
+            $proc.stdout.lines(:chomp).tap(-> $l { $out ~= "$l\n" });
+            $proc.stderr.lines(:chomp).tap(-> $l { $err ~= "$l\n" });
+            my $r = await $proc.start;
+            return { :ok($r.exitcode == 0), :stdout($out), :stderr($err), :exit($r.exitcode) };
+        }
+    }
     given %task<action> // '' {
         when 'fetch' {
             my $url     = %task<url> // '';
