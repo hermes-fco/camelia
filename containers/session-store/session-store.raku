@@ -263,8 +263,11 @@ sub handle-delete(Str $reply-to, %req) {
 
     my $purge-subject = "\$JS.API.STREAM.PURGE.SESSIONS";
     my $purge-body = to-json({ :filter("session.data.{$sid}") });
-    $nats.request: $purge-subject, $purge-body;
-    note "  🗑️ Deleted session {$sid}";
+    my $purge-supply = $nats.request: $purge-subject, $purge-body;
+    my $purge-p = $purge-supply.head.Promise;
+    await Promise.anyof: $purge-p, Promise.in(5);
+    my $purged = $purge-p.so && $purge-p.result && $purge-p.result.payload && !$purge-p.result.payload.starts-with('-ERR');
+    note $purged ?? "  🗑️ Deleted session {$sid}" !! "  ⚠️ Purge failed for {$sid}";
 
     $nats.publish: $reply-to, to-json({ :ok(True), :deleted($sid) });
 }

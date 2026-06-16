@@ -159,7 +159,7 @@ react {
         next unless $msg.payload;
 
         my $parsed = try from-json($msg.payload);
-        if $! || !$parsed {
+        if $! || !$parsed.defined {
             note "⚠️ Invalid JSON in task message";
             $task-consumer.ack($msg) if $task-consumer;
             next;
@@ -190,6 +190,12 @@ react {
         # start {} isolates the await-heavy process-task from the react
         # event loop — other whenever blocks (health) remain responsive
         start {
+            CATCH {
+                default {
+                    note "💥 process-task crashed: {.message}";
+                    try $nats.publish: $reply-to, to-json({ :error("Internal error: {.message}"), :chat_id($chat-id) });
+                }
+            }
             process-task($prompt, $reply-to, $session-id, $chat-id);
         }
     }

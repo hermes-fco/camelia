@@ -50,10 +50,9 @@ sub docker-api(Str $method, Str $path, Str $body?) {
     my $tmpfile = $body ?? "/tmp/docker-api-{(^10000).pick}.json" !! Nil;
     if $tmpfile {
         spurt $tmpfile, $body;
-        END { unlink $tmpfile if $tmpfile.IO.e }
     }
 
-    my @args = ('curl', '-s', '--unix-socket', $docker-sock, '-X', $method,
+    my @args = ('curl', '-s', '--max-time', '10', '--unix-socket', $docker-sock, '-X', $method,
                 '-H', 'Content-Type: application/json');
     @args.push: '-d', '@' ~ $tmpfile if $tmpfile;
     @args.push: $url;
@@ -63,6 +62,9 @@ sub docker-api(Str $method, Str $path, Str $body?) {
     $proc.stdout.lines(:chomp).tap(-> $line { $output ~= $line ~ "\n" });
     my $result = await $proc.start;
     my $exit   = $result.exitcode;
+
+    # Clean up temp file immediately
+    unlink $tmpfile if $tmpfile && $tmpfile.IO.e;
 
     if $exit != 0 {
         note "  ❌ Docker API error (exit={$exit}): {$output.substr(0, 200)}";
@@ -511,7 +513,10 @@ react {
     # ── GC: periodic zombie cleanup (still needs occasional Docker API check) ──
     # Reduced from 60s to 120s — most GC is now event-driven via worker.status.>
     whenever Supply.interval(120) {
-        handle-reactive-gc();
+        try {
+            handle-reactive-gc();
+            CATCH { note "⚠️ GC error: {.message}" }
+        }
     }
 
     # ── Health check ──

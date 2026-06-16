@@ -41,7 +41,6 @@ sub docker-api(Str $method, Str $path, Str $body?) {
     my $tmpfile = $body ?? "/tmp/docker-sys-{(^10000).pick}.json" !! Nil;
     if $tmpfile {
         spurt $tmpfile, $body;
-        END { unlink $tmpfile if $tmpfile.IO.e }
     }
     my @args = ('curl', '-s', '--unix-socket', $docker-sock, '-X', $method,
                 '-H', 'Content-Type: application/json');
@@ -51,6 +50,8 @@ sub docker-api(Str $method, Str $path, Str $body?) {
     my $output = '';
     $proc.stdout.lines(:chomp).tap(-> $line { $output ~= $line ~ "\n" });
     my $result = await $proc.start;
+    # Clean up temp file immediately
+    unlink $tmpfile if $tmpfile && $tmpfile.IO.e;
     return { :error("Docker API exit={$result.exitcode}") } if $result.exitcode != 0;
     return { :ok(True) } unless $output.trim;
     try from-json($output) // { :error("Invalid JSON from Docker API") };

@@ -30,6 +30,15 @@ sub lifecycle(Str $event) {
 my $task-sub = $nats.subscribe: 'worker.shell.>';
 note "🟢 Listening on worker.shell.>";
 
+# Register in KV so orchestrator knows about this worker type
+$nats.publish: '$KV.WORKER_REGISTRY.shell', to-json({
+    :name<shell>,
+    :subject("worker.shell.task.>"),
+    :description("Executes a SINGLE bash one-liner. Chain with && or ;"),
+    :topics([]),
+});
+note "📋 Registered shell worker in KV registry";
+
 # Health check
 my $health-sub = $nats.subscribe: 'health.check.worker.shell';
 
@@ -43,9 +52,9 @@ sub exec-tool(Str $name, Str $tc-id, %args --> Hash) {
     $nats.publish: "tools.exec.{$name}", to-json({
         :$name, :tool_call_id($tc-id), :arguments(%args),
     }), :reply-to($inbox);
-    await Promise.anyof: $p, Promise.in(30);
+    await Promise.anyof: $p, Promise.in(300);
     $nats.unsubscribe: $sub;
-    return { :error("Tool timeout") } unless $p.so;
+    return { :error("Tool timeout after 300s") } unless $p.so;
     my $msg = $p.result;
     return { :error("Empty tool response") } unless $msg && $msg.payload;
     try from-json($msg.payload) // { :error("Bad tool JSON") };

@@ -7,6 +7,7 @@ services:
     image: nats:latest
     command: --jetstream
     networks: [camelia]
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "nats-server", "--version"]
       interval: 5s
@@ -17,6 +18,7 @@ services:
       context: .
       dockerfile: containers/model-deepseek/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -32,6 +34,7 @@ services:
       context: .
       dockerfile: containers/model-deepseek/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -47,6 +50,7 @@ services:
       context: .
       dockerfile: containers/tool-executor/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -59,6 +63,7 @@ services:
       context: .
       dockerfile: containers/session-store/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -70,6 +75,7 @@ services:
       context: .
       dockerfile: containers/orchestrator/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -92,6 +98,7 @@ services:
       context: .
       dockerfile: containers/spawner/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -107,6 +114,7 @@ services:
       context: .
       dockerfile: containers/worker-shell/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -121,6 +129,7 @@ services:
       context: .
       dockerfile: containers/worker-factory/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -138,6 +147,7 @@ services:
       context: .
       dockerfile: containers/worker-timer/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -150,6 +160,7 @@ services:
       context: .
       dockerfile: containers/api.time/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -162,6 +173,7 @@ services:
       context: .
       dockerfile: containers/raku.compile/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -174,6 +186,7 @@ services:
       context: .
       dockerfile: containers/web-browser/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -186,6 +199,7 @@ services:
       context: .
       dockerfile: containers/web-search/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -198,6 +212,7 @@ services:
       context: .
       dockerfile: containers/entry-factory/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -213,6 +228,7 @@ services:
       context: .
       dockerfile: containers/entry-telegram/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -226,6 +242,7 @@ services:
       context: .
       dockerfile: containers/skill-store/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -238,6 +255,7 @@ services:
       context: .
       dockerfile: containers/docker-compose/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -254,6 +272,7 @@ services:
       context: .
       dockerfile: containers/auto-pilot/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy
@@ -275,6 +294,7 @@ services:
       context: .
       dockerfile: containers/system/Dockerfile
     networks: [camelia]
+    restart: unless-stopped
     depends_on:
       nats:
         condition: service_healthy

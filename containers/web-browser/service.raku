@@ -184,7 +184,7 @@ my $consumer = Nats::Consumer.new:
     :replay-policy<instant>,
     ;
 
-my $c-supply = $consumer.create-named;
+my $c-supply = $consumer.create;  # ephemeral — dies with worker, no orphaned consumers
 my $c-msg   = await $c-supply.Promise;
 if $c-msg && $c-msg.payload && !$c-msg.payload.starts-with('-ERR') {
     note "  ✅ Consumer {$consumer-name} created";
@@ -208,35 +208,44 @@ react {
         lifecycle('started');
     }
 
-    # ── Pull messages from JetStream — :batch, :no-wait (Fernando's pattern) ──
-    whenever $consumer.msgs(:batch(5), :no-wait) -> $msg {
-        next unless $msg.payload;
+    # ── Pull messages from JetStream — continuous loop, :expires for long poll ──
+    # :no-wait was buggy: supply completes after ONE batch → worker stops
+    start {
+        loop {
+            try {
+                $consumer.msgs(:batch(5), :expires(30)).tap: -> $msg {
+                    next unless $msg.payload;
 
-        if $msg.payload.starts_with('-ERR') {
-            note "⚠️ JetStream: {$msg.payload}";
-            last;
-        }
+                    if $msg.payload.starts_with('-ERR') {
+                        note "⚠️ JetStream: {$msg.payload}";
+                        return;
+                    }
 
-        my %task;
-        try { %task = from-json($msg.payload) };
-        if $! {
-            note "⚠️ Invalid JSON payload: {$!.message.substr(0, 80)}";
-            $consumer.nak($msg);
-            next;
-        }
+                    my %task;
+                    try { %task = from-json($msg.payload) };
+                    if $! {
+                        note "⚠️ Invalid JSON payload: {$!.message.substr(0, 80)}";
+                        $consumer.nak($msg);
+                        return;
+                    }
 
-        my $reply-to = %task<reply_to> // '';
-        unless $reply-to {
-            note "⚠️ Task without reply-to, skipping";
-            $consumer.ack($msg);
-            next;
-        }
+                    my $reply-to = %task<reply_to> // '';
+                    unless $reply-to {
+                        note "⚠️ Task without reply-to, skipping";
+                        $consumer.ack($msg);
+                        return;
+                    }
 
-        start {
-            handle-task(%task, $reply-to, $msg);
-            $consumer.ack($msg);
+                    start {
+                        handle-task(%task, $reply-to, $msg);
+                        $consumer.ack($msg);
+                    }
+                }
+            }
+            sleep 0.5;  # prevent tight loop on failure
         }
     }
+
 
     # ── Health check (with idle_seconds for spawner GC) ──
     whenever $health-sub.supply -> $msg {
