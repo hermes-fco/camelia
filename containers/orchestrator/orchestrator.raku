@@ -811,7 +811,7 @@ RETRY
 
 
     # ═══════ STEP 6: Synthesize (skip for timer-only — notification IS the response) ═══════
-    my $timer-only = @subtasks.elems > 0 && @subtasks.all({ $_<worker_type> eq "timer" });
+    my $timer-only = @subtasks.elems > 0 && !@subtasks.first({ $_<worker_type> ne "timer" });
     if $timer-only {
         note "⏱️ Timer-only — skipping synthesis, notification will be sent by timer worker";
         session-append-batch($sid, $seq, [
