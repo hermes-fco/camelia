@@ -37,15 +37,6 @@ await $nats.start;
 $nats.connect;
 note "🟢 Spawner connected.";
 
-my $sub = $nats.subscribe: 'spawner.control';
-note "🟢 Listening on spawner.control (max_workers=$max-workers)...";
-
-# ── Reactive worker lifecycle subscription ──
-my $worker-status-sub = $nats.subscribe: 'worker.status.>';
-note "🟢 Listening on worker.status.>";
-
-# Health check
-my $health-sub = $nats.subscribe: 'health.check.spawner';
 
 # ═════════════════════════════════════════════
 # DOCKER REST API HELPERS
@@ -514,19 +505,25 @@ sub kill-worker-by-type-id(Str $type, Str $worker-id) {
 note "🔄 Spawner react loop ready";
 
 react {
+    my $control-sub = $nats.subscribe: 'spawner.control';
+    my $worker-status-sub = $nats.subscribe: 'worker.status.>';
+    my $health-sub = $nats.subscribe: 'health.check.spawner';
+    note "🟢 Listening on spawner.control, worker.status.>, health.check.spawner";
+
     # ── Spawner control messages ──
-    whenever $sub.supply -> $msg {
+    whenever $control-sub.supply -> $msg {
         my $reply-to = $msg.?reply-to;
         unless $reply-to {
             note "⚠️ No reply-to, ignoring";
             next;
         }
 
-        my %req = try from-json($msg.payload);
-        if $! {
+        my $parsed = try from-json($msg.payload);
+        if $! || !$parsed {
             $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
             next;
         }
+        my %req = $parsed;
 
         my $action = %req<action> // '';
         given $action {

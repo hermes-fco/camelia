@@ -48,6 +48,23 @@ END
     }
 
     @lines.push: '';
+    @lines.push: '**EXAMPLES of correct decomposition:**';
+    @lines.push: '';
+    @lines.push: 'User: "What time is it in London?"';
+    @lines.push: '→ [{"id":"t1","worker_type":"web-browser","task":"https://time.is/London","role":"fetch London time"}]';
+    @lines.push: '';
+    @lines.push: 'User: "Search for Raku async patterns"';
+    @lines.push: '→ [{"id":"t1","worker_type":"web-search","task":"Raku async patterns","role":"search web"}]';
+    @lines.push: '';
+    @lines.push: 'User: "Remind me in 5 minutes to check email"';
+    @lines.push: '→ [{"id":"t1","worker_type":"timer","task":"check email","args":{"duration_minutes":5},"role":"set timer"}]';
+    @lines.push: '';
+    @lines.push: 'User: "What is 2 + 2?"';
+    @lines.push: '→ [{"id":"t1","worker_type":"shell","task":"echo $((2+2))","role":"calculate"}]';
+    @lines.push: '';
+    @lines.push: 'User: "Hello, how are you?"';
+    @lines.push: '→ []';
+    @lines.push: '';
     @lines.append: q:to/END/.lines;
 
 **DECISION TREE — follow this order:**
