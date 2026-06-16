@@ -24,6 +24,12 @@ my $model-subject  = %*ENV<MODEL_SUBJECT>  // 'model.deepseek.completion';
 my %worker-state;
 my $next-id = 1;
 
+# ── Per-type mutex: prevents concurrent ensure_typed for same type ──
+# Race: $sub.supply and worker.status.idle → check-and-spawn both call
+# handle-ensure-typed for same type → both see "not running" → both create → conflict
+my %ensure-locks;         # type → Lock
+my $lock-guard = Lock.new;  # protects %ensure-locks itself
+
 # ── Connect NATS ──
 note "🟡 Spawner connecting NATS ($nats-url)...";
 my $nats = Nats.new: :servers[$nats-url];
@@ -185,112 +191,142 @@ sub handle-ensure-typed(Str $type, Str $reply-to) {
 
     note "🔍 ensure_typed: type={$type} image={$image-name}";
 
-    # Check if already running
-    my $list = docker-api('GET', '/containers/json?all=true');
-    if $list ~~ Array {
-        for $list.List -> $c {
-            my @names = ($c<Names> // []).List;
-            for @names -> $n {
-                if $n.starts-with("/{$container-name}") && ($c<State> // '') eq 'running' {
-                    note "  ✅ {$container-name} already running";
-                    $nats.publish: $reply-to, to-json({ :ok(True), :container($container-name), :status<already_running> });
-                    return;
-                }
-                if $n.starts-with("/{$container-name}") {
-                    note "  🔄 {$container-name} exists but state={$c<State> // 'unknown'}, removing...";
-                    docker-api('DELETE', "/containers/{$c<Id>}");
+    # ── Per-type lock: prevent concurrent ensure_typed for same type ──
+    $lock-guard.protect: { %ensure-locks{$type} //= Lock.new };
+    my $lock = %ensure-locks{$type};
+
+    my $cid = '';
+    my $create-ok = False;
+
+    $lock.protect: {
+        # Check if already running
+        my $list = docker-api('GET', '/containers/json?all=true');
+        if $list ~~ Array {
+            for $list.List -> $c {
+                my @names = ($c<Names> // []).List;
+                for @names -> $n {
+                    if $n.starts-with("/{$container-name}") && ($c<State> // '') eq 'running' {
+                        note "  ✅ {$container-name} already running";
+                        $nats.publish: $reply-to, to-json({ :ok(True), :container($container-name), :status<already_running> });
+                        return;
+                    }
+                    if $n.starts-with("/{$container-name}") {
+                        note "  🔄 {$container-name} exists but state={$c<State> // 'unknown'}, removing...";
+                        docker-api('DELETE', "/containers/{$c<Id>}");
+                    }
                 }
             }
         }
-    }
 
-    # Check if image exists
-    my $img-check = docker-api('GET', "/images/{$image-name}/json");
-    if $img-check<error> {
-        note "  ❌ Image {$image-name} not found";
-        $nats.publish: $reply-to, to-json({
-            :ok(False), :error("Image '{$image-name}' not found"),
-            :reason<no_image>, :type($type),
-            :suggestion("Build image or use worker-factory to create this type"),
-        });
-        return;
-    }
-
-    note "  🐳 Starting {$container-name}...";
-    my @env = (
-        "NATS_URL=nats://nats:4222",
-        "SERVICE_NAME=worker-{$type}",
-    );
-
-    if $type eq 'model.deepseek' {
-        my $api-key = %*ENV<DEEPSEEK_API_KEY> // '';
-        if $api-key {
-            @env.push: "DEEPSEEK_API_KEY={$api-key}";
-            note "  🔑 Injecting DEEPSEEK_API_KEY";
+        # Check if image exists
+        my $img-check = docker-api('GET', "/images/{$image-name}/json");
+        if $img-check<error> {
+            note "  ❌ Image {$image-name} not found";
+            $nats.publish: $reply-to, to-json({
+                :ok(False), :error("Image '{$image-name}' not found"),
+                :reason<no_image>, :type($type),
+                :suggestion("Build image or use worker-factory to create this type"),
+            });
+            return;
         }
-        my $model-name = %*ENV<DEEPSEEK_MODEL> // 'deepseek-v4-pro';
-        @env.push: "DEEPSEEK_MODEL={$model-name}";
-    }
-    elsif $type.starts-with('model.ollama') {
-        my $ollama-url = %*ENV<OLLAMA_URL> // 'http://ollama:11434';
-        @env.push: "OLLAMA_URL={$ollama-url}";
-        my $model-name = $type.subst(/^ 'model.ollama.' /, '').subst('-', ':', :g);
-        @env.push: "OLLAMA_MODEL={$model-name}" if $model-name;
-    }
 
-    my %host-config = :NetworkMode<camelia_camelia>;
-    if $type eq 'system' {
-        %host-config<Binds> = ["/var/run/docker.sock:/var/run/docker.sock"];
-    }
+        note "  🐳 Starting {$container-name}...";
+        my @env = (
+            "NATS_URL=nats://nats:4222",
+            "SERVICE_NAME=worker-{$type}",
+        );
 
-    my $container-config = to-json({
-        :Image($image-name),
-        :Hostname($container-name),
-        :Env(@env),
-        HostConfig => %host-config,
-    });
+        if $type eq 'model.deepseek' {
+            my $api-key = %*ENV<DEEPSEEK_API_KEY> // '';
+            if $api-key {
+                @env.push: "DEEPSEEK_API_KEY={$api-key}";
+                note "  🔑 Injecting DEEPSEEK_API_KEY";
+            }
+            my $model-name = %*ENV<DEEPSEEK_MODEL> // 'deepseek-v4-pro';
+            @env.push: "DEEPSEEK_MODEL={$model-name}";
+        }
+        elsif $type.starts-with('model.ollama') {
+            my $ollama-url = %*ENV<OLLAMA_URL> // 'http://ollama:11434';
+            @env.push: "OLLAMA_URL={$ollama-url}";
+            my $model-name = $type.subst(/^ 'model.ollama.' /, '').subst('-', ':', :g);
+            @env.push: "OLLAMA_MODEL={$model-name}" if $model-name;
+        }
 
-    my %create = docker-api('POST', '/containers/create?name=' ~ $container-name, $container-config);
-    if %create<error> {
-        note "  ❌ Create failed: {%create<error>}";
-        $nats.publish: $reply-to, to-json({ :ok(False), :error("Container create failed: {%create<error>}") });
-        return;
-    }
-    my $cid = %create<Id> // '';
-    unless $cid {
-        note "  ❌ No container ID returned";
-        $nats.publish: $reply-to, to-json({ :ok(False), :error("No container ID") });
-        return;
-    }
+        my %host-config = :NetworkMode<camelia_camelia>;
+        if $type eq 'system' {
+            %host-config<Binds> = ["/var/run/docker.sock:/var/run/docker.sock"];
+        }
 
-    my %start = docker-api('POST', "/containers/{$cid}/start");
-    if %start<error> {
-        note "  ❌ Start failed: {%start<error>}";
-        docker-api('DELETE', "/containers/{$cid}");
-        $nats.publish: $reply-to, to-json({ :ok(False), :error("Container start failed") });
-        return;
-    }
+        my $container-config = to-json({
+            :Image($image-name),
+            :Hostname($container-name),
+            :Env(@env),
+            HostConfig => %host-config,
+        });
 
-    note "  ✅ {$container-name} ({$cid}) started";
+        my %create = docker-api('POST', '/containers/create?name=' ~ $container-name, $container-config);
+        if %create<error> {
+            # Check if container was created by a concurrent call (race recovery)
+            if %create<error> ~~ /'already in use'/ {
+                note "  🔄 Name conflict — concurrent create detected, re-checking...";
+                my $recheck = docker-api('GET', '/containers/json?all=true');
+                if $recheck ~~ Array {
+                    for $recheck.List -> $c {
+                        for ($c<Names> // []).List -> $n {
+                            if $n.starts-with("/{$container-name}") {
+                                if ($c<State> // '') eq 'running' {
+                                    note "  ✅ {$container-name} now running (concurrent create)";
+                                    $nats.publish: $reply-to, to-json({ :ok(True), :container($container-name), :status<already_running> });
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            note "  ❌ Create failed: {%create<error>}";
+            $nats.publish: $reply-to, to-json({ :ok(False), :error("Container create failed: {%create<error>}") });
+            return;
+        }
+        $cid = %create<Id> // '';
+        unless $cid {
+            note "  ❌ No container ID returned";
+            $nats.publish: $reply-to, to-json({ :ok(False), :error("No container ID") });
+            return;
+        }
 
-    # Verify container is stable
-    note "  🔍 Verifying {$container-name} is stable...";
-    sleep 3;
-    my $inspect = docker-api('GET', "/containers/{$cid}/json");
-    if $inspect<error> {
-        note "  ❌ Cannot inspect {$cid}: {$inspect<error>}";
-        $nats.publish: $reply-to, to-json({ :ok(False), :error("Container inspect failed") });
-        return;
+        my %start = docker-api('POST', "/containers/{$cid}/start");
+        if %start<error> {
+            note "  ❌ Start failed: {%start<error>}";
+            docker-api('DELETE', "/containers/{$cid}");
+            $nats.publish: $reply-to, to-json({ :ok(False), :error("Container start failed") });
+            return;
+        }
+
+        $create-ok = True;
+        note "  ✅ {$container-name} ({$cid}) created+started under lock";
+    }  # ── END LOCK ──
+
+    # ── Post-create verification (outside lock — container now exists) ──
+    if $create-ok {
+        note "  🔍 Verifying {$container-name} is stable (outside lock)...";
+        sleep 3;
+        my $inspect = docker-api('GET', "/containers/{$cid}/json");
+        if $inspect<error> {
+            note "  ❌ Cannot inspect {$cid}: {$inspect<error>}";
+            $nats.publish: $reply-to, to-json({ :ok(False), :error("Container inspect failed") });
+            return;
+        }
+        my $running-state = $inspect<State><Status> // '';
+        if $running-state ne 'running' {
+            note "  ❌ {$container-name} crashed on startup (state={$running-state})";
+            docker-api('DELETE', "/containers/{$cid}");
+            $nats.publish: $reply-to, to-json({ :ok(False), :error("Worker crashed on startup (state={$running-state})") });
+            return;
+        }
+        note "  🟢 {$container-name} stable (state={$running-state})";
+        $nats.publish: $reply-to, to-json({ :ok(True), :container($container-name), :$cid, :status<ready> });
     }
-    my $running-state = $inspect<State><Status> // '';
-    if $running-state ne 'running' {
-        note "  ❌ {$container-name} crashed on startup (state={$running-state})";
-        docker-api('DELETE', "/containers/{$cid}");
-        $nats.publish: $reply-to, to-json({ :ok(False), :error("Worker crashed on startup (state={$running-state})") });
-        return;
-    }
-    note "  🟢 {$container-name} stable (state={$running-state})";
-    $nats.publish: $reply-to, to-json({ :ok(True), :container($container-name), :$cid, :status<ready> });
 }
 
 # ═════════════════════════════════════════════
