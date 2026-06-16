@@ -34,12 +34,13 @@ react {
             next;
         }
 
-        my %req = try from-json($msg.payload);
-        if $! {
+        my $parsed = try from-json($msg.payload);
+        if $! || !$parsed {
             note "⚠️ Invalid JSON: {$!.message}";
             $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
             next;
         }
+        my %req = $parsed;
 
         my @messages = %req<messages>.List;
         note "📨 Prompt received (id={%req<id> // 'unknown'}, reply-to={$reply-to})";

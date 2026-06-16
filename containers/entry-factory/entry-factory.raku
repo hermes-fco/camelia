@@ -76,8 +76,6 @@ await $nats.start;
 $nats.connect;
 note "🟢 Entry Factory connected.";
 
-my $task-sub   = $nats.subscribe: 'entry.factory.request';
-my $health-sub = $nats.subscribe: 'health.check.entry.factory';
 note "🟢 Listening on entry.factory.request";
 
 # ── Model call helper ──
@@ -248,6 +246,9 @@ sub handle-factory-request(%req, Str $reply-to) {
 
 # ── React loop ──
 react {
+    my $task-sub   = $nats.subscribe: 'entry.factory.request';
+    my $health-sub = $nats.subscribe: 'health.check.entry.factory';
+    note "🟢 Listening on entry.factory.request, health";
     whenever $task-sub.supply -> $msg {
         next unless $msg.payload;
         my $reply-to = $msg.?reply-to;
@@ -256,11 +257,12 @@ react {
             next;
         }
 
-        my %req = try from-json($msg.payload);
-        if $! {
+        my $parsed = try from-json($msg.payload);
+        if $! || !$parsed {
             $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
             next;
         }
+        my %req = $parsed;
 
         start {
             handle-factory-request(%req, $reply-to);

@@ -39,8 +39,9 @@ react {
     # ── Event stream: keep local cache updated ──
     whenever $events-sub.supply -> $msg {
         next unless $msg.payload;
-        my %ev = try from-json($msg.payload);
-        next if $!;
+        my $ev-parsed = try from-json($msg.payload);
+        next if $! || !$ev-parsed;
+        my %ev = $ev-parsed;
         my $sid     = %ev<session_id> // '';
         my $role    = %ev<last_role>  // '';
         my $chat-id = %ev<chat_id>    // '';
@@ -80,8 +81,9 @@ react {
 
             my $resp-msg = $p.result;
             next unless $resp-msg && $resp-msg.payload;
-            my %resp = try from-json($resp-msg.payload);
-            next if $!;
+            my $resp-parsed = try from-json($resp-msg.payload);
+            next if $! || !$resp-parsed;
+            my %resp = $resp-parsed;
             next unless %resp<ok> && %resp<session>;
 
             my %session = %resp<session>;

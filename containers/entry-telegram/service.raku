@@ -221,8 +221,10 @@ start {
 react {
     whenever $reply-sub.supply -> $msg {
         next unless $msg.payload;
-        my %resp = try from-json($msg.payload);
+        my $parsed = try from-json($msg.payload);
+        if $! || !$parsed { note "⚠️ Bad reply JSON"; next }
         if $! { note "⚠️ Bad reply JSON"; next }
+        my %resp = $parsed;
 
         my $chat-id = %resp<chat_id> // '';
         my $text    = %resp<text> // %resp<result> // '';

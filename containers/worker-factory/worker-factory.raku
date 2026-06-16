@@ -315,11 +315,12 @@ react {
             next;
         }
 
-        my %req = try from-json($msg.payload);
-        if $! {
+        my $parsed = try from-json($msg.payload);
+        if $! || !$parsed {
             $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
             next;
         }
+        my %req = $parsed;
 
         $last-activity = now;
         lifecycle('busy');

@@ -296,11 +296,12 @@ react {
             next;
         }
 
-        my %task = try from-json($msg.payload);
-        if $! {
+        my $parsed = try from-json($msg.payload);
+        if $! || !$parsed {
             $nats.publish: $reply-to, to-json({ :ok(False), :error("Invalid JSON") });
             next;
         }
+        my %task = $parsed;
 
         my $topic = %task<topic> // %task<task> // '';
         my %args  = %task<arguments> // %task<args> // {};

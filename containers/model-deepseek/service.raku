@@ -47,6 +47,9 @@ sub deepseek-api(Str $body --> Str) {
 # ── Main loop ──
 
 react {
+    my $sub = $nats.subscribe: 'model.deepseek.completion';
+    my $health-sub = $nats.subscribe: 'health.check.model-deepseek';
+    note "🟢 Listening on model.deepseek.completion, health";
     whenever $sub.supply -> $msg {
         note "📨 MSG RECEIVED! payload={$msg.payload.chars} chars";
         next unless $msg.payload;

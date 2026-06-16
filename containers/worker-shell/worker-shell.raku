@@ -75,11 +75,12 @@ react {
             next;
         }
 
-        my %task = try from-json($msg.payload);
-        if $! {
+        my $parsed = try from-json($msg.payload);
+        if $! || !$parsed {
             $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
             next;
         }
+        my %task = $parsed;
 
         my $tool   = %task<tool>   // '';
         my $tc-id  = %task<id>     // 'unknown';
