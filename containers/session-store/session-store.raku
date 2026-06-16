@@ -29,16 +29,19 @@ await $nats.start;
 $nats.connect;
 note "🟢 Session Store connected.";
 
-# ── Subscribe: one wildcard + health ──
-my $main-sub   = $nats.subscribe: 'session.store.>';
-my $health-sub = $nats.subscribe: 'health.check.session-store';
-my $stream;      # initialized inside react after subscriptions are tapped
+# ── Stream handle (initialized inside react) ──
+my $stream;
 
 # ═════════════════════════════════════════════
 # MAIN LOOP — react + whenever (preferred pattern)
 # ═════════════════════════════════════════════
 
 react {
+    # ── Create subscriptions INSIDE react (nats.raku multi-sub bug workaround) ──
+    my $main-sub   = $nats.subscribe: 'session.store.>';
+    my $health-sub = $nats.subscribe: 'health.check.session-store';
+    note "🟢 Listening on session.store.>, health.check.session-store";
+
     # ── JetStream stream setup: run concurrently so subscriptions are tapped ──
     start {
         $stream = setup-stream();
@@ -51,11 +54,12 @@ react {
             note "⚠️ No reply-to on {$msg.subject}, ignoring";
             next;
         }
-        my %req = try from-json($msg.payload);
-        if $! {
+        my $parsed = try from-json($msg.payload);
+        if $! || !$parsed {
             $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
             next;
         }
+        my %req = $parsed;
 
         # Dispatch by subject suffix in a start {} block —
         # handlers like get/append/list use await which would block

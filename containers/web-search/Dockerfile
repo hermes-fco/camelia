@@ -1,0 +1,4 @@
+FROM camelia-base:latest
+RUN apt-get update -qq && apt-get install -y -qq curl ca-certificates 2>/dev/null || true
+COPY containers/web-search/service.raku /app/service.raku
+ENTRYPOINT ["raku", "/app/service.raku"]

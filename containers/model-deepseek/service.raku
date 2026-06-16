@@ -51,8 +51,9 @@ react {
         note "📨 MSG RECEIVED! payload={$msg.payload.chars} chars";
         next unless $msg.payload;
 
-        my %req = try from-json($msg.payload);
-        if $! { note "❌ JSON parse: $!"; next; }
+        my $parsed = try from-json($msg.payload);
+        if $! || !$parsed { note "❌ JSON parse: $!"; next; }
+        my %req = $parsed;
         my $request-id = %req<id> // 'unknown';
         my $reply-to   = $msg.?reply-to;
         note "📨 Prompt received (id=$request-id, reply-to={$reply-to // 'NONE'})";
