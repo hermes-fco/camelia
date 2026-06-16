@@ -4,6 +4,21 @@
 # Pulls tasks from JetStream WORKER_TASKS stream.
 # Self-terminates after 15 min idle.
 # Publishes worker.status.> events for spawner lifecycle tracking.
+#
+# ═══════════════════════════════════════════════════════════
+# 🔒 ISOLATION CONSTRAINT — NO SHARED FILESYSTEM
+#
+# Workers run in isolated containers. They MUST NOT:
+#   • Read files another worker wrote
+#   • Write files for another worker to consume
+#   • Assume /shared or any cross-container volume exists
+#
+# All inter-worker data exchange goes through NATS:
+#   Worker A → NATS result message → Orchestrator → NATS task message → Worker B
+#
+# For large payloads, use NATS Object Store (not files).
+# /tmp is local and volatile — assume it's wiped on container death.
+# ═══════════════════════════════════════════════════════════
 
 use Nats;
 use JSON::Fast;

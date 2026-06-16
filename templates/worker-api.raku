@@ -3,6 +3,21 @@
 #
 # Template for worker.factory to fill in.
 # Placeholders: {{NAME}}, {{DESCRIPTION}}, {{TOOLS_SCHEMA}}, {{TOOL_LOGIC}}
+#
+# ═══════════════════════════════════════════════════════════
+# 🔒 ISOLATION CONSTRAINT — NO SHARED FILESYSTEM
+#
+# Workers run in isolated containers. They MUST NOT:
+#   • Read files another worker wrote
+#   • Write files for another worker to consume
+#   • Assume /shared or any cross-container volume exists
+#
+# All inter-worker data exchange goes through NATS:
+#   Worker A → NATS result message → Orchestrator → NATS task message → Worker B
+#
+# For large payloads, use NATS Object Store (not files).
+# /tmp is local and volatile — assume it's wiped on container death.
+# ═══════════════════════════════════════════════════════════
 
 use Nats;
 use JSON::Fast;
