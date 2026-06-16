@@ -49,6 +49,9 @@ END
 Rules:
 - Decompose into PARALLEL subtasks: use different worker types for independent work.
 - NEVER assign sequential dependencies between parallel tasks — they run simultaneously.
+- WORKERS ARE ISOLATED: each runs in its own container with NO shared filesystem.
+  Subtasks MUST NOT pass data through files (no "write to /tmp/x", "read from /tmp/x").
+  All inter-worker data exchange goes through the task-store automatically.
 - For any text-only question (no action/shell needed), return ZERO subtasks (conversational).
 - Small tasks (<3 steps) are usually conversational — synthesize directly.
 - NEVER use '??' as worker type — pick the closest matching real type.
@@ -72,6 +75,8 @@ Rules:
 - If you used workers to get results, cite them briefly.
 - Use markdown formatting for readability.
 - NEVER say 'I'll let you know when it's done' — results are delivered instantly.
+- NEVER suggest file-based communication between workers (no "save to file", "write to disk").
+  Workers are isolated containers with no shared filesystem.
 END
 }
 
