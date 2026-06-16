@@ -24,6 +24,23 @@ services:
       - NATS_URL=nats://nats:4222
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - SERVICE_NAME=model-deepseek
+      - SERVICE_SUBJECT=model.deepseek.completion
+      - DEEPSEEK_MODEL=deepseek-v4-pro
+
+  model-deepseek-flash:
+    build:
+      context: .
+      dockerfile: containers/model-deepseek/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      - NATS_URL=nats://nats:4222
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - SERVICE_NAME=model-deepseek-flash
+      - SERVICE_SUBJECT=model.deepseek.flash
+      - DEEPSEEK_MODEL=deepseek-flash
 
   tool-executor:
     build:
@@ -67,6 +84,8 @@ services:
       - SERVICE_NAME=orchestrator
       - MAX_WORKERS=3
       - MODEL_SUBJECT=model.deepseek.completion
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
 
   spawner:
     build:
@@ -114,6 +133,18 @@ services:
       - MODEL_SUBJECT=model.deepseek.completion
       - FACTORY_RETRIES=3
 
+  worker-timer:
+    build:
+      context: .
+      dockerfile: containers/worker-timer/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      - NATS_URL=nats://nats:4222
+      - SERVICE_NAME=worker-timer
+
   worker-api-time:
     build:
       context: .
@@ -149,6 +180,18 @@ services:
     environment:
       - NATS_URL=nats://nats:4222
       - SERVICE_NAME=web-browser
+
+  worker-web-search:
+    build:
+      context: .
+      dockerfile: containers/web-search/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      - NATS_URL=nats://nats:4222
+      - SERVICE_NAME=web-search
 
   entry-factory:
     build:
@@ -190,6 +233,22 @@ services:
       - NATS_URL=nats://nats:4222
       - SERVICE_NAME=skill-store
 
+  docker-compose:
+    build:
+      context: .
+      dockerfile: containers/docker-compose/Dockerfile
+    networks: [camelia]
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      - NATS_URL=nats://nats:4222
+      - SERVICE_NAME=worker-docker-compose
+      - PROJECT_DIR=/camelia
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/camelia:ro
+
   auto-pilot:
     build:
       context: .
@@ -202,10 +261,14 @@ services:
         condition: service_started
       orchestrator:
         condition: service_started
+      model-deepseek-flash:
+        condition: service_started
     environment:
       - NATS_URL=nats://nats:4222
       - CHECK_INTERVAL=60
       - STALE_SECONDS=300
+      - SCAN_MODEL=1
+      - MODEL_SUBJECT=model.deepseek.flash
 
   worker-system:
     build:

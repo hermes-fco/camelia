@@ -43,19 +43,36 @@ END
 
         @lines.push: "- {$name} — {$desc}";
         if @topics {
-            for @topics -> $t {
-                @lines.push: "  • {$t}";
-            }
+            @lines.push: "  topics: {@topics.join(', ')}";
         }
     }
 
     @lines.push: '';
     @lines.append: q:to/END/.lines;
+
+**DECISION TREE — follow this order:**
+
+1. **FIRST, check if ANY existing worker can handle the task EXACTLY:**
+   - web-browser: ONLY for fetching specific URLs (starts with http:// or https://). It CANNOT search.
+   - web-search: For search queries (natural language, not URLs). Use for "search for X", "find information about Y".
+   - system: For querying Camélia's own state — sessions, containers, health, config.
+   - docker-compose: For managing Camélia containers and config files.
+   - shell: LAST resort for simple bash commands. NOT for HTTP requests, NOT for web searches.
+
+2. **If NO existing worker matches EXACTLY → use factory to create one.**
+   Factory creates NEW worker types at runtime. This is the PREFERRED path for missing capabilities.
+   Examples requiring factory:
+   - "search the web for X" when web-search is not available → factory
+   - "send an email to X" → factory to create email-sender
+   - "post to Twitter" → factory to create twitter-poster
+
+3. **Only use shell as fallback for SIMPLE operations** (file listing, echo, grep on local files).
+
+**Conversational vs Action:**
 Given a user request — and optionally conversation history — decide if it needs tool calls or can be answered directly.
+If the request is conversational (greetings, chitchat, emotional support, follow-up questions that don't need external data), output an EMPTY array: `[]`
 
-**If the request is conversational** (greetings, chitchat, emotional support, follow-up questions that don't need external data), output an EMPTY array: `[]`
-
-**If the request requires action**, decompose it into 1-3 INDEPENDENT subtasks that can be executed by worker agents.
+If the request requires action, decompose it into 1-3 INDEPENDENT subtasks.
 
 Output ONLY a JSON array (empty or with subtask objects):
 []
@@ -64,7 +81,8 @@ Output ONLY a JSON array (empty or with subtask objects):
     "id": "task-1",
     "role": "brief role description",
     "worker_type": "<name from list above>",
-    "task": "the action to perform"
+    "task": "the action to perform",
+    "args": {"key": "value"}
   }
 ]
 
@@ -74,17 +92,42 @@ Rules:
 - Subtasks MUST be independent (no dependencies between them)
 - Every subtask needs a "worker_type" field matching one of the available types
 - If conversation history is provided, use it to maintain continuity
-- Worker type {{factory}} creates NEW worker types — use when needed capability doesn't exist
+- **DISPATCH long-running commands** (sleep, builds, downloads, etc.) — do NOT try to run them yourself. The system handles progress notifications and follow-ups automatically.
+- **Timer tasks MUST include args**: "duration_seconds" (Int) or "duration_minutes" (Num). Example: {"args":{"duration_seconds":30}} or {"args":{"duration_minutes":5}}
+- **Timer notifications include the current date/time automatically.** For requests like "tell me the time in X" or "remind me in Y", just ONE timer subtask is enough — no separate time-fetching subtask needed. The timer notification will show: "🔔 Timer! _[message]_ 🕐 Hora atual: [datetime]"
 - Output ONLY the JSON array, nothing else — no markdown fences, no explanations
 END
 
     @lines.join("\n");
 }
 
-my $synth-system = q:to/END/;
-You are a synthesis agent. Given the original request and individual worker results, combine them into a single coherent response.
-Be concise and direct. If there is previous conversation history, maintain continuity.
+sub build-synth-prompt(Str $sid --> Str) {
+    my @lines = q:to/END/.lines;
+You are Camélia, a multi-agent AI assistant. Given the original request and worker results, combine them into a single coherent response. Be concise and direct. If there is previous conversation history, maintain continuity.
 END
+
+    @lines.push: "";
+    @lines.push: "**Your capabilities (via workers):**";
+    for %workers.values.sort({ .<name> }) -> %w {
+        @lines.push: "- **{%w<name>}**: {%w<description>}";
+    }
+    @lines.push: "";
+    @lines.push: "Key facts about this system:";
+    @lines.push: "- You have a **factory** worker that can CREATE new worker types at runtime.";
+    @lines.push: "- If a user asks for something no existing worker can do, suggest using the factory.";
+    @lines.push: "- Never say 'I can't do that' without first checking if the factory could create a worker for it.";
+    @lines.push: "- You run inside Camélia, a Raku multi-agent framework with NATS JetStream messaging.";
+    @lines.push: "";
+    @lines.push: "**Async notifications — YOU CAN ALWAYS REACH THE USER:**";
+    @lines.push: "- For long-running tasks (shell commands, downloads, builds), the system automatically sends progress updates.";
+    @lines.push: "- When a background task completes, the result is automatically delivered as a follow-up message.";
+    @lines.push: "- **NEVER say 'I can't notify you when it's done'** — the system handles this. Just say 'I'll update you when it finishes.'";
+    @lines.push: "- You are always connected — if a task is running, tell the user you'll follow up. You WILL follow up.";
+    @lines.push: "";
+    @lines.push: "Session ID: {$sid}";
+
+    @lines.join("\n");
+}
 
 # ── Connect NATS ──
 
@@ -98,6 +141,12 @@ my $health-sub = $nats.subscribe: 'health.check.orchestrator';
 my $registry-sub = $nats.subscribe: '$KV.WORKER_REGISTRY.>';
 note "🟢 Orchestrator subscribed, entering react...";
 my $task-chan = Channel.new;
+my $task-consumer;  # module scope — acked in whenever $task-chan handler
+
+
+# ── Inbox generation (BEFORE react — must initialize before event loop) ──
+my @inbox-chars = |("a" .. "z"), |("A" .. "Z"), |("0" .. "9"), "_";
+sub gen-inbox(--> Str) { "_INBOX." ~ (@inbox-chars.pick xx 32).join }
 
 react {
     # ── JetStream setup: run concurrently so subscriptions are already tapped ──
@@ -108,29 +157,35 @@ react {
 
     whenever $task-chan -> $msg {
         next unless $msg.payload;
-        my $reply-to = $msg.?reply-to;
-        unless $reply-to {
-            note "⚠️ orchestrator.task without reply-to, ignoring";
-            next;
-        }
 
-        my %req = try from-json($msg.payload);
-        if $! {
-            $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
+        my $parsed = try from-json($msg.payload);
+        if $! || !$parsed {
+            note "⚠️ Invalid JSON in task message";
+            $task-consumer.ack($msg) if $task-consumer;
             next;
         }
+        my %req = $parsed;
 
         my $prompt     = %req<prompt>     // '';
         my $session-id = %req<session_id> // '';
         my $chat-id    = %req<chat_id>    // '';
+        # reply_to from PAYLOAD (survives JetStream), fallback to NATS header
+        my $reply-to   = %req<reply_to>   // $msg.?reply-to // '';
 
         unless $prompt {
-            $nats.publish: $reply-to, to-json({ :error("Missing 'prompt' field") });
+            note "⚠️ orchestrator.task without prompt, ignoring";
+            next;
+        }
+        unless $reply-to {
+            note "⚠️ orchestrator.task without reply_to, ignoring";
             next;
         }
 
         note "📨 New task: {$prompt.substr(0, 100)}..." ~
             ($session-id ?? " (session: $session-id)" !! "");
+
+        # 🔒 ACK immediately — message validated, prevent redelivery loop
+        $task-consumer.ack($msg) if $task-consumer;
 
         # start {} isolates the await-heavy process-task from the react
         # event loop — other whenever blocks (health) remain responsive
@@ -177,6 +232,14 @@ sub stream(Str $session-id, Str $status, :$message, :$data, :$subtask_count, :$r
 
     my $subject = "session.{$session-id}.stream";
     $nats.publish: $subject, to-json(%payload);
+}
+
+# ── Status notification to user via reply_to (entry-telegram listens here) ──
+sub notify-user(Str $reply-to, Str $chat-id, Str $message, Str :$edit_key) {
+    return unless $reply-to && $chat-id && $message;
+    my %payload = :text($message), :chat_id($chat-id), :parse_mode<markdown>;
+    %payload<edit_key> = $edit_key if $edit_key;
+    $nats.publish: $reply-to, to-json(%payload);
 }
 
 # ═════════════════════════════════════════════
@@ -234,7 +297,7 @@ sub session-append-batch(Str $sid, Int $expected-seq, @entries --> Hash) {
 # JETSTREAM SETUP — per-type streams for reliable delivery
 # ═════════════════════════════════════════════
 
-my constant @WORKER-TYPES = <shell web-browser system>;
+my constant @WORKER-TYPES = <shell web-browser system timer>;
 my %stream-names;  # worker_type → stream name
 my %consumer-names; # worker_type → durable consumer name
 
@@ -292,21 +355,32 @@ sub setup-jetstream() {
     my $tss = $ts.create; my $tsm = await $tss.Promise;
     note $tsm ?? "  ✅ Stream ORCHESTRATOR_TASKS" !! "  ⚠️ ORCHESTRATOR_TASKS";
 
-    my $tc = Nats::Consumer.new:
+    $task-consumer = Nats::Consumer.new:
         :$nats, :name<orchestrator-main>, :stream<ORCHESTRATOR_TASKS>,
         :ack-policy<explicit>, :deliver-policy<all>,
         :filter-subject("orchestrator.task"),
         :max-ack-pending(10), :ack-wait(120), :replay-policy<instant>,
         ;
-    my $tcs = $tc.create-named;
+    my $tcs = $task-consumer.create-named;
     my $tcm = await $tcs.Promise;
     note ($tcm && $tcm.payload && !$tcm.payload.starts-with("-ERR"))
         ?? "  ✅ Consumer orchestrator-main → Channel"
         !! "  ⚠️ Consumer: {$tcm.?payload // "no response"}";
 
-    $tc.msgs(:batch(5), :no-wait).tap: -> $msg {
-        $task-chan.send($msg) if $msg.payload;
-    };
+    # Continuous pull loop via Channel bridge (Jun 2026 fix)
+    # :no-wait → supply completes after ONE batch → no new tasks received
+    # :expires(30) → long poll, loop keeps pulling indefinitely
+    start {
+        loop {
+            try {
+                $task-consumer.msgs(:batch(5), :expires(30)).tap: -> $msg {
+                    $task-chan.send($msg) if $msg.?payload;
+                };
+            }
+            sleep 0.5;  # prevent tight loop on persistent failure
+        }
+    }
+    note "  ✅ Consumer pull loop → Channel";
 
     # ── Worker Registry KV (persistent, survives restart) ──
     note "📋 Creating Worker Registry KV...";
@@ -331,6 +405,8 @@ sub setup-jetstream() {
         system => { :name<system>, :subject("worker.system.task.>"),
                    :description("Queries Camelia system: containers, health, sessions, reconfig"),
                    :topics(["containers_list","container_detail","system_health","session_get","session_list","reconfigure"]) },
+        timer => { :name<timer>, :subject("worker.timer.task.>"),
+                   :description("Sets timers and notifies user when they fire. Use for reminders, countdowns, 'tell me in X minutes'. Args: duration_minutes (Num) or duration_seconds (Int)"), :topics([]) },
         factory => { :name<factory>, :subject("worker.factory.request"),
                    :description("Creates new worker types from specifications"), :topics([]) },
     );
@@ -347,11 +423,19 @@ sub setup-jetstream() {
 # REQUEST-REPLY — uses $nats.request (native nats.raku)
 # ═════════════════════════════════════════════
 
+# ── Manual inbox pattern (avoids nats.raku $nats.request race condition) ──
+# Pitfall #17: $nats.request() published BEFORE the Supply was tapped.
+# In threaded context (start {}), reply could arrive before .Promise was called,
+# and the un-tapped head(1) Supply would drop the value forever.
+# Fix: subscribe + tap Promise BEFORE publish — no window for the reply to be lost.
 sub request-reply(Str $subject, Str $payload, Int :$timeout = 120 --> Hash) {
-    my $supply = $nats.request: $subject, $payload;
-    my $p = $supply.head.Promise;
+    my $inbox  = gen-inbox();
+    my $sub    = $nats.subscribe: $inbox, :max-messages(1);
+    my $p      = $sub.supply.head.Promise;  # TAP BEFORE publish — no race window
+    $nats.publish: $subject, $payload, :reply-to($inbox);
 
     await Promise.anyof: $p, Promise.in($timeout);
+    $nats.unsubscribe: $sub.sid;
 
     my %result = do if $p.so {
         my $msg = $p.result;
@@ -362,7 +446,7 @@ sub request-reply(Str $subject, Str $payload, Int :$timeout = 120 --> Hash) {
         }
     } else {
         { :error("No response from {$subject}") };
-    };
+    }
 
     return %result;
 }
@@ -387,7 +471,7 @@ sub synthesize-and-respond(Str $prompt, Str $reply-to, Str $sid, Int $seq,
     stream($sid, 'synthesizing', :message("Generating direct response..."));
 
     my @synth-msgs = (
-        { :role<system>, :content($synth-system ~ "\n\nSession ID: {$sid}") },
+        { :role<system>, :content(build-synth-prompt($sid)) },
     );
     for @history -> $entry {
         @synth-msgs.push: $entry;
@@ -448,6 +532,9 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?, Str $chat-id?) {
 
     stream($sid, 'received', :message("Task received: {$prompt.substr(0, 80)}..."));
 
+    # Notify user that we're working on it
+    # notify-user($reply-to, $chat-id, "📋 *Analisando:* _{$prompt.substr(0, 100)}..._");
+
     # ═══════ STEP 1: Decompose (with history from session-store) ═══════
     note "📋 Decomposing (session {$sid}, task #{$task-n})...";
     my $decomp-prompt = build-decomp-prompt();
@@ -498,6 +585,12 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?, Str $chat-id?) {
         :subtask_count(+@subtasks),
     );
 
+    # Notify user what we're doing
+    my @worker-names = @subtasks.map({ $_<worker_type> // '?' }).unique;
+    my $has-timer = @subtasks.first({ $_<worker_type> eq "timer" });
+    my $edit-key = $has-timer ?? "timer-{" ~ $has-timer<id> ~ "}" !! Str;
+    notify-user($reply-to, $chat-id, "⏳ *Processando...* ({+@subtasks} subtarefas)", :edit_key($edit-key));
+
     # ═══════ STEP 2: Publish tasks to JetStream-backed worker streams ═══════
     # Spawner independently monitors streams and spawns workers as needed.
     # No need to wait for workers — JetStream buffers messages.
@@ -528,6 +621,12 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?, Str $chat-id?) {
         # Pass args for system tasks (e.g., container_detail needs name)
         %payload<args> = $st<args> if $st<args>:exists;
 
+        # Timer worker needs user reply info for async notifications
+        if $wtype eq 'timer' {
+            %payload<user_reply_to> = $reply-to;
+            %payload<user_chat_id>  = $chat-id;
+        }
+
         # Factory requests need different payload format
         if $wtype eq 'factory' {
             %payload = :prompt($st<task>), :spec({ :name($task-id), :description($st<role>) }), :reply_to($result-inbox);
@@ -539,15 +638,51 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?, Str $chat-id?) {
         note "  📤 {$task-id} ({$wtype}) → {$subject} (reply: {$result-inbox})";
     }
 
-    # ═══════ STEP 3: Collect results ═══════
-    note "⏳ Waiting for {+@result-promises} worker result(s) (60s timeout)...";
+    # ═══════ STEP 3: Collect results with progress notifications ═══════
+    note "⏳ Waiting for {+@result-promises} worker result(s) (300s timeout)...";
+    my $total-timeout  = 300;
+    my $poll-interval  = 15;
+    my $notify-every   = 30;
+    my $last-notify    = 0;
     my $all = Promise.allof(@result-promises);
-    await Promise.anyof: $all, Promise.in(60);
-    my @results = $all.so
-        ?? @result-promises.map(*.result)
-        !! [{ :error("Worker result timeout after 60s") },];
+    my $elapsed = 0;
 
+    while $elapsed < $total-timeout && !$all.so {
+        await Promise.anyof: $all, Promise.in($poll-interval);
+        $elapsed += $poll-interval;
+
+        if !$all.so && $elapsed < $total-timeout {
+            my $done = @result-promises.grep(*.so).elems;
+            if $elapsed - $last-notify >= $notify-every && $done > 0 {
+                notify-user($reply-to, $chat-id,
+                    "⏳ *Ainda processando...* ({$done}/{+@result-promises} workers completos, {$elapsed}s)");
+                $last-notify = $elapsed;
+            } elsif $elapsed - $last-notify >= $notify-every {
+                notify-user($reply-to, $chat-id,
+                    "⏳ *Aguardando workers...* ({$elapsed}s)");
+                $last-notify = $elapsed;
+            }
+        }
+    }
+
+    my @results;
     my $done-count = 0;
+    if $all.so {
+        @results = @result-promises.map(*.result);
+    } else {
+        # Partial — collect whatever resolved
+        note "⏰ Timeout after {$elapsed}s — collecting partial results";
+        for @result-promises -> $p {
+            if $p.so {
+                @results.push: $p.result;
+            } else {
+                @results.push: { :error("Worker result timeout after {$elapsed}s") };
+            }
+        }
+        notify-user($reply-to, $chat-id,
+            "⚠️ *Timeout após {$elapsed}s* — coletando resultados parciais...");
+    }
+
     for @results -> $r {
         if $r<error> {
             note "  ❌ {$r<worker-id> // '?'}: {$r<error>}";
@@ -674,7 +809,24 @@ RETRY
         return;
     }
 
-    # ═══════ STEP 6: Synthesize (with history) ═══════
+
+    # ═══════ STEP 6: Synthesize (skip for timer-only — notification IS the response) ═══════
+    my $timer-only = @subtasks.elems > 0 && @subtasks.all({ $_<worker_type> eq "timer" });
+    if $timer-only {
+        note "⏱️ Timer-only — skipping synthesis, notification will be sent by timer worker";
+        session-append-batch($sid, $seq, [
+            { :role<user>,      :content($prompt) },
+            { :role<assistant>, :content("⏱️ Timer set. Notification incoming...") },
+        ]);
+        stream($sid, "done",
+            :message("Timer dispatched — awaiting notification"),
+            :subtask_count(+@subtasks),
+        );
+        note "✅ Timer task dispatched (session {$sid}).";
+        $tasks-done++;
+        return;
+    }
+
     note "🧠 Synthesizing...";
     stream($sid, 'synthesizing', :message("Synthesizing final response..."));
 
@@ -686,7 +838,7 @@ RETRY
     }
 
     my @synth-msgs = (
-        { :role<system>, :content($synth-system ~ "\n\nSession ID: {$sid}") },
+        { :role<system>, :content(build-synth-prompt($sid)) },
     );
     for @history -> $entry {
         @synth-msgs.push: $entry;
