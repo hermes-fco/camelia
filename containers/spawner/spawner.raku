@@ -83,7 +83,7 @@ sub nats-request(Str $subject, Str $payload, Int :$timeout = 10 --> Hash) {
     my $p   = $sub.supply.head.Promise;
     $nats.publish: $subject, $payload, :reply-to($inbox);
     await Promise.anyof: $p, Promise.in($timeout);
-    $nats.unsubscribe: $sub;
+    $sub.unsubscribe;
     return { :error("No response") } unless $p.so;
     my $msg = $p.result;
     return { :error("Empty response") } unless $msg && $msg.payload;
@@ -559,6 +559,7 @@ sub kill-worker-by-type-id(Str $type, Str $worker-id) {
 my $ctl-sub    = $nats.subscribe: 'spawner.control';
 my $ws-sub     = $nats.subscribe: 'worker.status.>';
 my $worker-sub = $nats.subscribe: 'worker.>';       # watch all worker task publications
+my $ts-sub     = $nats.subscribe: 'task.store.>';   # watch task-store creates for spawn decisions
 note "🟢 Spawner ready.";
 
 my $last-alive = now.Int;
@@ -607,6 +608,28 @@ react {
         unless $has-worker {
             note "👀 Worker monitor: {$type} needed, spawning...";
             handle-ensure-typed($type, '_INBOX.spawner-monitor.' ~ (^10000).pick);
+        }
+    }
+
+    # ── Task-store monitor: watch task.store.create for spawning decisions ──
+    # When orchestrator or other services create tasks in the task-store with a
+    # specific worker_type, spawn a worker of that type if none is running.
+    whenever $ts-sub.supply -> $msg {
+        my $subject = $msg.subject // '';
+        next unless $subject.ends-with('.create');
+        next unless $msg.payload;
+
+        my $parsed = try from-json($msg.payload);
+        next unless $parsed.defined;
+        my $wtype = $parsed<worker_type> // '';
+        next unless $wtype;
+        next if $wtype eq 'factory' | 'orchestrator';  # always running
+
+        # Quick check: skip if we already have a non-busy worker of this type
+        my $has-worker = %worker-state.values.first({ .<type> eq $wtype && .<last-event> ne 'busy' });
+        unless $has-worker {
+            note "👀 Task-store: {$wtype} task created, spawning worker...";
+            handle-ensure-typed($wtype, '_INBOX.spawner-ts.' ~ (^10000).pick);
         }
     }
 

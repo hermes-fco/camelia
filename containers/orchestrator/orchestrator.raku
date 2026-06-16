@@ -217,8 +217,22 @@ sub setup-jetstream() {
 
 sub task-store-create(Str $prompt, :$session-id, :$chat-id, :$priority, :$worker-type --> Str) {
     request-reply('task.store.create', to-json({
-        :description($prompt), :$session-id, :$chat-id, :$priority, :$worker-type
+        :description($prompt), :$session-id, :$chat-id, :$priority,
+        :worker_type($worker-type // 'orchestrator'),
     }), :timeout(5))<id> // ''
+}
+
+sub task-store-create-subtask(Str $task-id, Str $description, Str $worker-type,
+                               Str :$session-id, Str :$chat-id --> Str) {
+    request-reply('task.store.create', to-json({
+        :id($task-id), :$description,
+        :worker_type($worker-type),
+        :$session-id, :$chat-id, :priority(5), :created_by('orchestrator'),
+    }), :timeout(5))<id> // ''
+}
+
+sub task-store-get(Str $task-id --> Hash) {
+    request-reply('task.store.get', to-json({ :id($task-id) }), :timeout(5))
 }
 
 sub task-store-update(Str $task-id, Str $status, :$result, :$error --> Nil) {
@@ -408,90 +422,102 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?, Str $chat-id?, St
         "`{$workers-str}`",
         :edit_key($edit-key));
 
-    # STEP 2: Publish tasks (spawner watches worker.> and spawns workers automatically)
-    note "📤 Publishing {+@subtasks} tasks to worker streams...";
+    # STEP 2: Create subtasks in task-store (workers claim via task.store.next)
+    # Also notify spawner via worker.<type>.task.> ping so it knows to spawn workers
+    note "📤 Creating {+@subtasks} subtasks in task-store...";
 
-    my @result-promises;
-    my @task-workers;
+    my @subtask-entries;  # { id, worker_type, done, result }
     for @subtasks -> $st {
         my $task-id   = $st<id> // ('task-' ~ (^1000).pick);
         my $wtype     = $st<worker_type> // 'shell';
-        my $result-inbox = "_INBOX.result.{$task-id}." ~ (('a'..'z').pick xx 8).join;
 
-        my $result-sub = $nats.subscribe: $result-inbox, :1max-messages;
-        my $result-promise = $result-sub.supply.head.Promise.then: -> $p {
-            my $msg = $p.result;
-            return { :error("Worker {$task-id}: no response") } unless $msg && $msg.payload;
-            try from-json($msg.payload) // { :error("Bad result JSON") };
-        };
-        @result-promises.push: $result-promise;
-        @task-workers.push: $wtype;
-
-        my $subject = $wtype eq 'factory'
-            ?? 'worker.factory.request'
-            !! "worker.{$wtype}.task.{$task-id}";
-
-        my %payload = :id($task-id), :role($st<role>), :task($st<task>),
-                      :session-id($sid), :reply_to($result-inbox);
-        %payload<args> = $st<args> if $st<args>:exists;
-        if $wtype eq 'timer' {
-            %payload<user_reply_to> = $reply-to;
-            %payload<user_chat_id>  = $chat-id;
+        my $created = task-store-create-subtask($task-id, $st<task>, $wtype,
+            :session-id($sid), :chat-id($chat-id));
+        if $created {
+            @subtask-entries.push: { :id($task-id), :worker_type($wtype), :done(False), :result(Nil) };
+            note "  📝 {$task-id} ({$wtype}) → task-store";
+            # Ping spawner: notify worker.<type>.task.<id> so spawner creates worker if needed
+            $nats.publish: "worker.{$wtype}.task.{$task-id}", to-json({ :type<ping>, :$task-id });
+        } else {
+            note "  ⚠️ Failed to create subtask {$task-id} — will skip";
         }
-        if $wtype eq 'factory' {
-            %payload = :prompt($st<task>), :spec({ :name($task-id), :description($st<role>) }), :reply_to($result-inbox);
-        }
-
-        $nats.publish: $subject, to-json(%payload), :reply-to($result-inbox);
-        note "  📤 {$task-id} ({$wtype}) → {$subject}";
     }
 
-    # STEP 3: Collect results with progress (EDIT, not new messages)
-    note "⏳ Waiting for {+@result-promises} worker result(s) (300s timeout)...";
+    unless @subtask-entries {
+        my $err = "Failed to create any subtasks in task-store";
+        $nats.publish: $reply-to, to-json({ :error($err), :chat_id($chat-id) });
+        stream($sid, 'error', :message($err));
+        task-store-update($task-store-id, 'failed', :error($err)) if $task-store-id;
+        return;
+    }
+
+    # STEP 3: Poll task-store until all subtasks complete
+    note "⏳ Waiting for {+@subtask-entries} subtask(s) (300s timeout)...";
     my $total-timeout = 300;
-    my $poll-interval = 15;
+    my $poll-interval = 5;
     my $notify-every  = 30;
     my $last-notify   = 0;
-    my $all = Promise.allof(@result-promises);
     my $elapsed = 0;
 
-    while $elapsed < $total-timeout && !$all.so {
-        await Promise.anyof: $all, Promise.in($poll-interval);
+    while $elapsed < $total-timeout {
+        my $all-done = True;
+        my $done-count = 0;
+        for @subtask-entries -> $entry {
+            next if $entry<done>;
+
+            my %resp = task-store-get($entry<id>);
+            if %resp<ok> && %resp<task> {
+                my $status = %resp<task><status> // '';
+                if $status eq 'completed' {
+                    $entry<done> = True;
+                    $entry<result> = %resp<task><result> // '';
+                    $done-count++;
+                    note "  ✅ {$entry<id>} completed";
+                } elsif $status eq 'failed'|'cancelled' {
+                    $entry<done> = True;
+                    $entry<result> = { :error(%resp<task><error_msg> // $status) };
+                    $done-count++;
+                    note "  ❌ {$entry<id>} {%resp<task><error_msg> // $status}";
+                }
+            }
+            unless $entry<done> { $all-done = False }
+        }
+
+        last if $all-done;
+        await Promise.in($poll-interval);
         $elapsed += $poll-interval;
 
-        if !$all.so && $elapsed < $total-timeout {
-            if $elapsed - $last-notify >= $notify-every {
-                my @pending-idxs = @result-promises.pairs.grep({ !.value.so })».key;
-                my @pending-workers = @pending-idxs.map({ @task-workers[$_] }).unique.sort;
-                my $pw-str = @pending-workers.join(', ');
-                my $done = +@result-promises - +@pending-idxs;
-
-                # ✅ Usa o mesmo progress-key pra EDITAR a mensagem, não criar nova
-                my $msg = $done > 0
-                    ?? "⏳ *{$done}/{+@result-promises} concluído*\n" ~
-                       "Decorrido: {$elapsed}s\n" ~
-                       "Pendente: `{$pw-str}`"
-                    !! "⏳ *Aguardando workers...*\n" ~
-                       "Decorrido: {$elapsed}s\n" ~
-                       "Pendente: `{$pw-str}`";
-                notify-user($reply-to, $chat-id, $msg, :edit_key($progress-key));
-                $last-notify = $elapsed;
-            }
+        if !$all-done && $elapsed < $total-timeout && $elapsed - $last-notify >= $notify-every {
+            my $pending = +@subtask-entries - $done-count;
+            my @pending-types = @subtask-entries.grep({ !.<done> }).map({ .<worker_type> }).unique.sort;
+            my $pw-str = @pending-types.join(', ');
+            my $msg = $done-count > 0
+                ?? "⏳ *{$done-count}/{+@subtask-entries} concluído*\\nDecorrido: {$elapsed}s\\nPendente: `{$pw-str}`"
+                !! "⏳ *Aguardando workers...*\\nDecorrido: {$elapsed}s\\nPendente: `{$pw-str}`";
+            notify-user($reply-to, $chat-id, $msg, :edit_key($progress-key));
+            $last-notify = $elapsed;
         }
     }
 
-    if $elapsed >= $total-timeout && !$all.so {
+    if $elapsed >= $total-timeout {
         note "⚠️ Timeout after {$elapsed}s — collecting partial results";
         notify-user($reply-to, $chat-id,
-            "⚠️ *Timeout após {$elapsed}s*\nColetando resultados parciais...",
+            "⚠️ *Timeout após {$elapsed}s*\\nColetando resultados parciais...",
             :edit_key($progress-key));
     }
 
-    # STEP 4: Collect results
+    # STEP 4: Collect results from completed entries
     my @results;
-    for @result-promises.kv -> $i, $p {
-        if $p.so { @results.push: $p.result }
-        else     { @results.push: { :error("Worker timed out") } }
+    for @subtask-entries -> $entry {
+        if $entry<done> && $entry<result> {
+            if $entry<result> ~~ Hash {
+                @results.push: $entry<result>;
+            } else {
+                @results.push: { :output($entry<result>.Str), :task_id($entry<id>), :worker_type($entry<worker_type>) };
+            }
+        } else {
+            @results.push: { :error("Task {$entry<id>} timed out after {$elapsed}s"), :task_id($entry<id>), :worker_type($entry<worker_type>) };
+        }
     }
 
     my $successes = @results.grep({ !.<error> }).elems;
@@ -531,8 +557,8 @@ sub process-task(Str $prompt, Str $reply-to, Str $session-id?, Str $chat-id?, St
 
     my $results-block = '';
     for @results.kv -> $i, $r {
-        my $label = $r<worker-id> // "worker-{$i}";
-        $results-block ~= "=== {$label} ({$r<role> // '?'}) ===\n";
+        my $label = $r<task_id> // $r<worker_type> // "result-{$i}";
+        $results-block ~= "=== {$label} ===\n";
         $results-block ~= to-json $r ~ "\n\n";
     }
 

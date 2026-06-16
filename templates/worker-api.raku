@@ -12,8 +12,10 @@
 #   • Write files for another worker to consume
 #   • Assume /shared or any cross-container volume exists
 #
-# All inter-worker data exchange goes through NATS:
-#   Worker A → NATS result message → Orchestrator → NATS task message → Worker B
+# All inter-worker data exchange goes through the TASK-STORE:
+#   Orchestrator → task.store.create (subtask) → task-store
+#   Worker → task.store.next → processes → task.store.update
+#   Orchestrator → polls task-store for completed tasks
 #
 # For large payloads, use NATS Object Store (not files).
 # /tmp is local and volatile — assume it's wiped on container death.
@@ -47,9 +49,6 @@ sub lifecycle(Str $event) {
     $nats.publish: "{$lifecycle-subject}.{$event}",
         to-json({ :$worker-id, :type('{{NAME}}'), :$event, :ts(now.Real) });
 }
-# Subscribe to typed tasks
-my $task-sub = $nats.subscribe: 'worker.{{NAME}}.task.>';
-note "🟢 Listening on worker.{{NAME}}.task.>";
 
 # Health check
 my $health-sub = $nats.subscribe: 'health.check.{{NAME}}';
@@ -57,11 +56,24 @@ my $health-sub = $nats.subscribe: 'health.check.{{NAME}}';
 # ── Track idle time (for spawner GC) ──
 my $last-activity = now;
 
+# ── NATS request-reply helper ──
+sub nats-request(Str $subject, Str $payload, Int :$timeout = 30 --> Hash) {
+    my $sub = $nats.subscribe: my $inbox = "_INBOX.wkr." ~ (^1_000_000).pick, :1max-messages;
+    my $p   = $sub.supply.head.Promise;
+    $nats.publish: $subject, $payload, :reply-to($inbox);
+    await Promise.anyof: $p, Promise.in($timeout);
+    $sub.unsubscribe;
+    return { :error("No response") } unless $p.so;
+    my $msg = $p.result;
+    return { :error("Empty response") } unless $msg && $msg.payload;
+    try from-json($msg.payload) // { :error("JSON parse fail") };
+}
+
 # ── HTTP helper ──
 sub http-get(Str $path, :%headers = ()) {
     my @args = ('curl', '-s', '--connect-timeout', '10', BASE-URL ~ $path);
     for %headers.kv -> $k, $v { @args.push: '-H', "{$k}: {$v}" }
-    if API-KEY { @args.push: '-H', 'Authorization: Bearer ' ~ API-KEY }
+    if API-KEY { @args.push: '-H', 'Authorization: Bearer *** ~ API-KEY }
 
     my $proc = Proc::Async.new(|@args);
     my $output = '';
@@ -74,42 +86,54 @@ sub http-get(Str $path, :%headers = ()) {
 
 # {{TOOLS_SCHEMA}}
 
-react {
-    # ── Publish lifecycle.started after spawner's react is tapped ──
-    start {
-        sleep 0.5;
-        lifecycle('started');
-    }
+# ── Task polling loop: claim from task-store, process, update ──
+start {
+    sleep 0.5;  # let react start first
+    lifecycle('started');
 
-    whenever $task-sub.supply -> $msg {
-        next unless $msg.payload;
-        my $reply-to = $msg.?reply-to;
-        unless $reply-to {
-            note "⚠️ No reply-to, ignoring";
+    loop {
+        # Claim next pending task for this worker type
+        my %resp = nats-request('task.store.next',
+            to-json({ :worker_type('{{NAME}}') }), :timeout(10));
+
+        unless %resp<ok> && %resp<task> {
+            # No tasks available — sleep and retry
+            sleep 2;
             next;
         }
 
-        my %task = try from-json($msg.payload);
-        if $! {
-            $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
-            next;
-        }
-
-        my $action = %task<action> // '';
-        note "📨 {{NAME}}-{$worker-id}: {$action}";
+        my %task = %resp<task>;
+        my $task-id = %task<id> // '';
+        note "📨 {{NAME}}-{$worker-id}: claimed {$task-id} — {%task<description>.substr(0, 80)}";
 
         $last-activity = now;
         lifecycle('busy');
 
-        start {
+        try {
             my %result = handle-task(%task);
-            $nats.publish: $reply-to, to-json(%result);
+            my $result-str = to-json(%result);
 
-            $last-activity = now;
-            lifecycle('idle');
+            nats-request('task.store.update', to-json({
+                :id($task-id), :status<completed>, :result($result-str),
+            }), :timeout(10));
         }
-    }
 
+        CATCH {
+            default {
+                note "  ❌ Task {$task-id} crashed: {.message}";
+                try nats-request('task.store.update', to-json({
+                    :id($task-id), :status<failed>, :error_msg(.message),
+                }), :timeout(10));
+            }
+        }
+
+        $last-activity = now;
+        lifecycle('idle');
+    }
+}
+
+react {
+    # ── Health check (with idle_seconds for spawner GC) ──
     whenever $health-sub.supply -> $msg {
         if $msg.?reply-to {
             $nats.publish: $msg.reply-to, to-json({
@@ -123,5 +147,5 @@ react {
 
 sub handle-task(%task --> Hash) {
     # {{TOOL_LOGIC}}
-    return { :error("No handler for action '{%task<action>}'") };
+    return { :error("No handler for action '{%task<action>}'\nTask: {%task<description>}") };
 }

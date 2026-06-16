@@ -1,8 +1,9 @@
 #!/usr/bin/env raku
-# 🌺 Camélia — Web Browser Worker (JetStream pull consumer)
+# 🌺 Camélia — Web Browser Worker (task-store pull)
 #
-# Pulls tasks from WORKER_WEB_BROWSER stream via $consumer.msgs(:batch, :no-wait).
-# Lifecycle events published to worker.status.web-browser.<id>.*
+# Claims tasks from task-store via task.store.next,
+# fetches URLs with curl + optional chromium JS rendering,
+# updates task-store with results.
 
 use Nats;
 use JSON::Fast;
@@ -25,6 +26,20 @@ sub lifecycle(Str $event) {
     $nats.publish: "{$lifecycle-subject}.{$event}",
         to-json({ :$worker-id, :type<web-browser>, :$event, :ts(now.Real) });
 }
+
+# ── NATS request-reply helper ──
+sub nats-request(Str $subject, Str $payload, Int :$timeout = 30 --> Hash) {
+    my $sub = $nats.subscribe: my $inbox = "_INBOX.wbr." ~ (^1_000_000).pick, :1max-messages;
+    my $p   = $sub.supply.head.Promise;
+    $nats.publish: $subject, $payload, :reply-to($inbox);
+    await Promise.anyof: $p, Promise.in($timeout);
+    $sub.unsubscribe;
+    return { :error("No response") } unless $p.so;
+    my $msg = $p.result;
+    return { :error("Empty response") } unless $msg && $msg.payload;
+    try from-json($msg.payload) // { :error("JSON parse fail") };
+}
+
 # ── Check for headless browser ──
 sub find-headless-browser(--> Str) {
     for <chromium-browser chromium google-chrome google-chrome-stable> -> $bin {
@@ -119,18 +134,15 @@ sub extract-title(Str $html --> Str) {
 # ── Handle task ──
 my $last-activity = now;
 
-sub handle-task(%task, Str $reply-to, $msg) {
-    my $task-str = %task<task> // '';
-    note "📨 {$service-name}-{$worker-id}: {$task-str.substr(0, 80)}...";
+sub handle-task(%task --> Hash) {
+    my $desc = %task<description> // '';
+    note "📨 {$service-name}-{$worker-id}: {$desc.substr(0, 80)}...";
 
-    $last-activity = now;
-    lifecycle('busy');
-
-    # Determine if it's a URL or a command
-    my $url = $task-str;
-    if $task-str ~~ /^ 'curl '/ {
-        note "  ⚠️ curl command received, fetching directly...";
-        $url = $task-str.subst(/^ 'curl ' .*? ' '/, '').subst(/\s+.*$/, '');
+    # Determine if it's a URL or a search query
+    my $url = $desc;
+    if $desc ~~ /^ 'curl '/ {
+        note "  ⚠️ curl command received, extracting URL...";
+        $url = $desc.subst(/^ 'curl ' .*? ' '/, '').subst(/\s+.*$/, '');
     }
 
     my %result = curl-fetch($url, :timeout(20));
@@ -143,110 +155,74 @@ sub handle-task(%task, Str $reply-to, $msg) {
             note "  ✅ JS render ok ({%js-result<content>.chars} chars)";
             my $text  = html-to-text(%js-result<content>);
             my $title = extract-title(%js-result<content>);
-            %result = { :ok(True), :$title, :$text, :status(200), :js_rendered(True) };
+            %result = %( :ok(True), :$title, :$text, :status(200), :js_rendered(True) );
         }
     } elsif %result<ok> {
         my $text  = html-to-text(%result<content>);
         my $title = extract-title(%result<content>);
-        %result = { :ok(True), :$title, :$text, :status(%result<status>), :js_rendered(False) };
+        %result = %( :ok(True), :$title, :$text, :status(%result<status>), :js_rendered(False) );
     }
 
     %result<worker-id> = $worker-id;
-    $nats.publish: $reply-to, to-json(%result);
-    note "  ✅ Result sent to {$reply-to} (" ~ (%result<text> // %result<content> // '').chars ~ " chars)";
-
-    $last-activity = now;
-    lifecycle('idle');
-}
-
-# ═════════════════════════════════════════════
-# JETSTREAM CONSUMER — async pull via .msgs
-# ═════════════════════════════════════════════
-
-my $stream-name = 'WORKER_WEB_BROWSER';
-note "📥 Creating JetStream consumer on {$stream-name}...";
-
-my $stream = Nats::Stream.new:
-    :$nats,
-    :name($stream-name),
-    ;
-
-my $consumer-name = "{$service-name}-{$worker-id}";
-my $consumer = Nats::Consumer.new:
-    :$nats,
-    :name($consumer-name),
-    :stream($stream-name),
-    :ack-policy<explicit>,
-    :deliver-policy<all>,
-    :filter-subject('worker.web-browser.task.>'),
-    :max-ack-pending(5),
-    :ack-wait(120),
-    :replay-policy<instant>,
-    ;
-
-my $c-supply = $consumer.create;  # ephemeral — dies with worker, no orphaned consumers
-my $c-msg   = await $c-supply.Promise;
-if $c-msg && $c-msg.payload && !$c-msg.payload.starts-with('-ERR') {
-    note "  ✅ Consumer {$consumer-name} created";
-} else {
-    note "  ⚠️ Consumer create: {$c-msg.?payload // 'no response'}";
+    %result<url> = $url;
+    return %result;
 }
 
 # Health check
 my $health-sub = $nats.subscribe: 'health.check.web.browser';
 
 # ═════════════════════════════════════════════
-# MAIN REACT LOOP — assíncrono, sem polling
+# MAIN LOOP — poll task-store for tasks
 # ═════════════════════════════════════════════
 
-note "🔄 Async pull loop ready — {$consumer-name}";
+note "🔄 Task polling loop ready — {$service-name}-{$worker-id}";
+
+start {
+    sleep 0.5;  # let react start first
+    lifecycle('started');
+
+    loop {
+        # Claim next pending task for web-browser type
+        my %resp = nats-request('task.store.next',
+            to-json({ :worker_type('web-browser') }), :timeout(10));
+
+        unless %resp<ok> && %resp<task> {
+            sleep 2;
+            next;
+        }
+
+        my %task = %resp<task>;
+        my $task-id = %task<id> // '';
+        note "📨 {$service-name}-{$worker-id}: claimed {$task-id}";
+
+        $last-activity = now;
+        lifecycle('busy');
+
+        try {
+            my %result = handle-task(%task);
+            my $result-str = to-json(%result);
+
+            nats-request('task.store.update', to-json({
+                :id($task-id), :status<completed>, :result($result-str),
+            }), :timeout(10));
+            note "  ✅ {$task-id} completed";
+        }
+
+        CATCH {
+            default {
+                note "  ❌ Task {$task-id} crashed: {.message}";
+                try nats-request('task.store.update', to-json({
+                    :id($task-id), :status<failed>, :error_msg(.message),
+                }), :timeout(10));
+            }
+        }
+
+        $last-activity = now;
+        lifecycle('idle');
+    }
+}
 
 react {
-    # Publish started AFTER react is running (spawner needs time to tap supplies)
-    start {
-        sleep 0.5;
-        lifecycle('started');
-    }
-
-    # ── Pull messages from JetStream — continuous loop, :expires for long poll ──
-    # :no-wait was buggy: supply completes after ONE batch → worker stops
-    start {
-        loop {
-            try {
-                $consumer.msgs(:batch(5), :expires(30)).tap: -> $msg {
-                    next unless $msg.payload;
-
-                    if $msg.payload.starts_with('-ERR') {
-                        note "⚠️ JetStream: {$msg.payload}";
-                        return;
-                    }
-
-                    my %task;
-                    try { %task = from-json($msg.payload) };
-                    if $! {
-                        note "⚠️ Invalid JSON payload: {$!.message.substr(0, 80)}";
-                        $consumer.nak($msg);
-                        return;
-                    }
-
-                    my $reply-to = %task<reply_to> // '';
-                    unless $reply-to {
-                        note "⚠️ Task without reply-to, skipping";
-                        $consumer.ack($msg);
-                        return;
-                    }
-
-                    start {
-                        handle-task(%task, $reply-to, $msg);
-                        $consumer.ack($msg);
-                    }
-                }
-            }
-            sleep 0.5;  # prevent tight loop on failure
-        }
-    }
-
-
     # ── Health check (with idle_seconds for spawner GC) ──
     whenever $health-sub.supply -> $msg {
         if $msg.?reply-to {

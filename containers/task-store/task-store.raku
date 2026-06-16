@@ -124,7 +124,7 @@ sub handle-next(Str $reply-to, %req) {
     my $wtype = %req<worker_type> // '';
     sql-exec('BEGIN IMMEDIATE');
     my $where = "status = 'pending'";
-    if $wtype { $where ~= " AND (worker_type = '{esc($wtype)}' OR worker_type = '')" }
+    if $wtype { $where ~= " AND (worker_type = '{esc($wtype)}' OR (worker_type = '' AND (created_by != 'orchestrator' OR created_by IS NULL)))" }
     my @rows = sql-query("SELECT id FROM tasks WHERE {$where} ORDER BY priority DESC, created_at ASC LIMIT 1");
     unless @rows { sql-exec('ROLLBACK'); reply($reply-to, { :ok(True), :task(Nil), :message("No pending tasks") }); return }
     my $id = @rows[0]<id>; my $now = now-str();
