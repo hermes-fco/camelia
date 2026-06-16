@@ -26,12 +26,17 @@ note "🟢 entry.telegram connected.";
 # Health check
 my $health-sub = $nats.subscribe: 'health.check.entry.telegram';
 
-# Reply subscription: orchestrator sends responses here
-my $reply-sub = $nats.subscribe: 'entry.telegram.response';
-note "🟢 Listening for replies on entry.telegram.response";
+# Reply subscription: orchestrator sends responses here (per-chat routing)
+my $reply-sub = $nats.subscribe: 'entry.telegram.response.>';
+note "🟢 Listening for replies on entry.telegram.response.>";
 
 # Track session per chat for conversation continuity
 my %chat-sessions;  # chat_id → session_id
+
+# 🔒 Secure token relay: chat awaiting token → worker inbox
+my %awaiting-token;  # chat_id → worker_token_inbox
+my %awaiting-confirm; # chat_id → confirm_inbox (for long-running task confirmation)
+my %edit-state;       # edit_key → {chat_id, message_id} for editing progress messages
 
 # ── Telegram API helpers (all Proc::Async) ──
 sub telegram-get(Str $method, Str $params = '') {
@@ -63,9 +68,30 @@ sub telegram-post(Str $method, %data) {
 sub send-telegram(Str $chat-id, Str $text, :$parse-mode = '') {
     my %data = :chat_id($chat-id), :$text;
     %data<parse_mode> = $parse-mode if $parse-mode;
-    my $resp = telegram-post('sendMessage', %data);
-    note $resp ?? "  📤 Sent to {$chat-id}" !! "  ❌ Failed to send to {$chat-id}";
-    return $resp;
+    my $raw = telegram-post('sendMessage', %data);
+    return {} unless $raw;
+    my %result = try from-json($raw) // {};
+    if %result<ok> {
+        note "  📤 Sent to {$chat-id}";
+        return %result;
+    }
+    note "  ❌ Send failed {$chat-id}: {%result<description> // $raw.substr(0, 100)}";
+    return {};
+}
+
+# ── Edit message on Telegram ──
+sub edit-telegram(Str $chat-id, Int $message-id, Str $text, :$parse-mode = '') {
+    my %data = :chat_id($chat-id), :message_id($message-id), :$text;
+    %data<parse_mode> = $parse-mode if $parse-mode;
+    my $raw = telegram-post('editMessageText', %data);
+    return False unless $raw;
+    my %result = try from-json($raw) // {};
+    if %result<ok> {
+        note "  ✏️ Edited {$chat-id}:{$message-id}";
+        return True;
+    }
+    note "  ❌ Edit failed {$chat-id}:{$message-id} — {%result<description> // $raw.substr(0, 100)}";
+    return False;
 }
 
 # ── Publish to NATS ──
@@ -112,14 +138,56 @@ start {
                 if $data<ok> && $data<result> -> @updates {
                     for @updates -> $update {
                         $offset = $update<update_id> + 1;
-                        with $update<message> {
+                        # Handle both message and edited_message
+                        my $msg-key = $update<message>   ?? 'message'   !!
+                                      $update<edited_message> ?? 'edited_message' !! Nil;
+                        unless $msg-key {
+                            note "⚠️ Non-message update: " ~ to-json($update.keys, :!pretty) ~ " → " ~ to-json($update, :!pretty).substr(0, 200);
+                            next;
+                        }
+                        with $update{$msg-key} {
                             my $msg  = $_;
                             my $chat = $msg<chat> // {};
                             my $from = $msg<from> // {};
                             my $text = $msg<text> // $msg<caption> // '';
-                            next unless $text;
+                            unless $text {
+                                note "⚠️ Skipping message without text: " ~ to-json($msg, :!pretty).substr(0, 200);
+                                next;
+                            }
 
                             my $cid = $chat<id>.Str;
+
+                            # 🤝 Confirm relay: orchestrator asked user a question → route answer
+                            if %awaiting-confirm{$cid} -> $confirm-inbox {
+                                note "🤝 Confirm relay: {$cid} → {$confirm-inbox}: {$text.substr(0, 80)}";
+                                $nats.publish: $confirm-inbox, $text;
+                                %awaiting-confirm{$cid}:delete;
+                                start-typing($cid);
+                                next;
+                            }
+
+                            # 🔒 Token relay: if this chat is awaiting token, relay directly to worker
+                            if %awaiting-token{$cid} -> $worker-inbox {
+                                note "🔒 Token relay: {$cid} → {$worker-inbox}";
+                                $nats.publish: $worker-inbox, $text;
+                                %awaiting-token{$cid}:delete;
+                                send-telegram($cid, "🔒 Token recebido e encaminhado com segurança.");
+                                stop-typing($cid);
+                                next;
+                            }
+
+                            # 🔄 /rotate <worker> — trigger token rotation
+                            if $text ~~ /^ '/' rotate \s+ (\S+) / {
+                                my $worker-type = $0.Str;
+                                note "🔄 Rotate command: {$worker-type} from {$cid}";
+                                $nats.publish: "worker.{$worker-type}.control",
+                                    to-json({ :action<rotate>, :chat_id($cid) });
+                                send-telegram($cid,
+                                    "🔄 Comando de rotação enviado para `{$worker-type}`.\n" ~
+                                    "Se o worker estiver ativo, ele vai solicitar o novo token.");
+                                stop-typing($cid);
+                                next;
+                            }
 
                             # Start typing indicator (keeps refreshing until response)
                             start-typing($cid);
@@ -129,6 +197,7 @@ start {
                                           :username($from<username> // ''),
                                           :first_name($from<first_name> // ''),
                                           :source($entry-name),
+                                          :reply_to('entry.telegram.response.' ~ $cid),
                                           :ts(DateTime.now.Str);
 
                             # Pass existing session_id for conversation continuity
@@ -137,7 +206,8 @@ start {
 
                             $nats.publish: 'orchestrator.task',
                                 to-json(%payload),
-                                :reply-to('entry.telegram.response');
+                                :reply-to('entry.telegram.response'),
+                                :ack, :timeout(5);  # JetStream-aware publish
                         }
                     }
                 }
@@ -169,10 +239,42 @@ react {
             note "  🔗 Session {$chat-id} → {%resp<session_id>}";
         }
 
+        # 🔒 Token request: store awaiting state, next user message goes to worker
+        if %resp<token_request> && %resp<worker_token_inbox> {
+            %awaiting-token{$chat-id} = %resp<worker_token_inbox>;
+            note "  🔒 Token mode ON for {$chat-id} → {%resp<worker_token_inbox>}";
+        }
+
+        # 🤝 Confirm request: next user message goes to confirm inbox
+        if %resp<confirm_request> && %resp<confirm_inbox> {
+            %awaiting-confirm{$chat-id} = %resp<confirm_inbox>;
+            note "  🤝 Confirm mode ON for {$chat-id} → {%resp<confirm_inbox>}";
+        }
+
         start {
-            stop-typing($chat-id);  # Stop the typing indicator loop
+            stop-typing($chat-id);
             note "  📤 RESPONSE TEXT: {$text.substr(0, 150)}...";
-            send-telegram($chat-id, $text, :parse-mode($parse));
+
+            my $edit-key = %resp<edit_key> // '';
+            if $edit-key && %edit-state{$edit-key} {
+                # Edit existing message instead of sending new one
+                my %st = %edit-state{$edit-key};
+                my $ok = edit-telegram($chat-id, %st<message_id>, $text, :parse-mode($parse));
+                unless $ok {
+                    # Edit failed (message deleted?) — send new and update state
+                    my $resp-msg = send-telegram($chat-id, $text, :parse-mode($parse));
+                    with $resp-msg<result><message_id> {
+                        %edit-state{$edit-key} = %( :chat_id($chat-id), :message_id($_) );
+                    }
+                }
+            } else {
+                my $resp-msg = send-telegram($chat-id, $text, :parse-mode($parse));
+                if $edit-key {
+                    with $resp-msg<result><message_id> {
+                        %edit-state{$edit-key} = %( :chat_id($chat-id), :message_id($_) );
+                    }
+                }
+            }
         }
     }
 
