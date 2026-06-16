@@ -73,7 +73,7 @@ method !process-buffer {
                 when Nats::Data {
                     given .type {
                         when "ok"   {                    }
-                        when "err"  { note "⚠️ NATS -ERR: {$cmd.data}"      }
+                        when "err"  { die $cmd.data      }
                         when "ping" { self!print: "PONG" }
                         when "pong" {                    }
                         when "info" {
@@ -127,39 +127,48 @@ method !gen-inbox {
 }
 
  method request(
-     Str    $subject,
-     Str()  $payload?,
-     Str   :$reply-to     = self!gen-inbox,
-     UInt  :$max-messages = 1,
-     UInt  :$timeout,
-           :%headers,
- ) {
-     my $sub = self.subscribe: $reply-to, |($max-messages ?? :$max-messages !! Empty);
-     return $sub.supply unless $max-messages;
-     my $head-supply = $sub.supply.head($max-messages);
-     self.publish: $subject, |(.Str with $payload), :$reply-to,
-         |( %headers.elems ?? :%headers !! Empty );
-     without $timeout {
-         return $head-supply;
-     }
-     # Race response against timeout — unsubscribe on timeout so
-     # the head supply completes naturally (with no message).
-     supply {
-         whenever $head-supply -> $msg {
-             emit $msg;
-             done;
-         }
-         whenever Promise.in($timeout) {
-             $sub.unsubscribe;
-             done;
-         }
-     }
- }
+    Str   $subject,
+    Str() $payload?,
+    Str   :$reply-to     = self!gen-inbox,
+    UInt  :$max-messages = 1,
+          :headers(%headers),
+    UInt  :$timeout,
+) {
+    my $sub = self.subscribe: $reply-to, |($max-messages ?? :$max-messages !! Empty);
+    return $sub.supply unless $max-messages;
+    my $head-supply = $sub.supply.head($max-messages);
 
-multi method unsubscribe(Nats::Subscription $sub, UInt :$max-messages) {
-    self.unsubscribe: $sub.sid, |(:$max-messages with $max-messages)
+    # Tap BEFORE publish — prevents race condition (Pitfall #17).
+    # Use a Promise so we can return a Supply that emits the captured value,
+    # avoiding the untapped-Supply window between publish() and caller's tap.
+    my $p = Promise.new;
+    my $vow = $p.vow;
+    $head-supply.tap: -> $msg { $vow.keep($msg) }, done => { $vow.keep(Nil) unless $p.so };
+
+    self.publish: $subject, |(.Str with $payload), :$reply-to,
+        |( %headers.elems ?? :headers(%headers) !! Empty );
+
+    without $timeout {
+        return supply {
+            my $msg = await $p;
+            emit $msg if $msg;
+        }
+    }
+    # Race response against timeout
+    supply {
+        my $timeout-fired = False;
+        whenever $p -> $msg {
+            emit $msg if $msg;
+            done unless $timeout-fired;
+            $timeout-fired = True;
+        }
+        whenever Promise.in($timeout) {
+            $sub.unsubscribe;
+            done unless $timeout-fired;
+            $timeout-fired = True;
+        }
+    }
 }
-
 multi method unsubscribe(UInt $sid, UInt :$max-messages) {
     self!print: "UNSUB", $sid, $max-messages // Empty;
     %!subs{$sid}:delete;
@@ -169,10 +178,10 @@ method publish(
     Str   $subject,
     Str() $payload = "",
     Str   :$reply-to,
+          :headers(%headers),
     Bool  :$ack = False,
     Str   :$msg-id,
     UInt  :$timeout = 5,
-          :%headers,
 ) {
     return self!publish-with-ack: $subject, $payload, :$msg-id, :$timeout if $ack;
     %headers && %headers.elems
@@ -196,7 +205,7 @@ method !publish-with-ack(
     my $p = start await $sub.supply.head.Promise;
 
     self.publish: $subject, $payload, :$reply-to,
-        |( %headers.elems ?? :%headers !! Empty );
+        |( %headers.elems ?? :headers(%headers) !! Empty );
 
     await Promise.anyof: $p, Promise.in($timeout);
     $p.so ?? $p.result !! Nil
@@ -315,7 +324,7 @@ Returns a Promise kept on connection.
 =begin code :lang<raku>
 $nats.publish: $subject, $payload;
 $nats.publish: $subject, $payload, :reply-to($inbox);
-$nats.publish: $subject, $payload, :%headers;
+$nats.publish: $subject, $payload, :headers(%headers);
 $nats.publish: $subject, $payload, :ack, :msg-id($id), :timeout(10);
 =end code
 
@@ -323,12 +332,12 @@ Publishes a message to a subject.
 
 Options:
 =item C<:reply-to> — reply subject for request-reply patterns
-=item C<:%headers> — Hash of NATS headers splatted as named arguments (uses HPUB protocol)
+=item C<:headers> — Hash of NATS headers (uses HPUB protocol)
 =item C<:ack> — enable JetStream publish-with-ack (returns C<Nats::Message> or Nil)
 =item C<:msg-id> — deduplication ID (requires :ack)
 =item C<:timeout> — ack timeout in seconds (default: 5)
 
-With C<:%headers>, the method uses HPUB (headers publish) which correctly
+With C<:headers>, the method uses HPUB (headers publish) which correctly
 counts both header block size and total size in bytes for UTF-8 payloads.
 
 =head2 subscribe
@@ -348,7 +357,7 @@ Options:
 =head2 request
 
 =begin code :lang<raku>
-my $supply = $nats.request: "ping", "hello", :%h;
+my $supply = $nats.request: "ping", "hello", :headers(%h);
 my $supply = $nats.request: "ping", "hello", :timeout(5);
 =end code
 
@@ -356,7 +365,7 @@ Publishes a request and returns a Supply of response messages.
 A unique inbox is auto-generated for the reply subject.
 
 Options:
-=item C<:%headers> — Hash of NATS headers splatted as named arguments
+=item C<:headers> — Hash of NATS headers
 =item C<:max-messages> — maximum responses to collect (default: 1)
 =item C<:timeout> — seconds to wait before auto-unsubscribing if no response arrives
 

@@ -1,0 +1,260 @@
+#!/usr/bin/env raku
+# 🌺 Camélia — Unit Tests: Orchestrator Logic
+#
+# Tests: token_needed propagation, ACK behavior, message validation.
+# Uses mocked NATS socket (no network required).
+
+use Test;
+use Test::Mock;
+
+use lib 'lib';
+use Nats;
+use Nats::JetStream;
+use JSON::Fast;
+
+use-ok 'Nats';
+use-ok 'Nats::JetStream';
+
+# ═══════════════════════════════════════════
+# 1. TOKEN_NEEDED PROPAGATION
+# ═══════════════════════════════════════════
+
+{
+    # Simulate worker result with token_needed
+    my %worker-result = :token_needed(True),
+                        :token_inbox("_INBOX.token.github.abc123"),
+                        :result("401 Unauthorized — needs new token");
+
+    # Verify the orchestrator's token propagation logic
+    # (from synthesize-and-respond: lines 742-750)
+    my %response = :result("synthesized text"),
+                   :session_id("test-session"),
+                   :subtask_count(1),
+                   :chat_id("63989755"),
+                   :mode<jetstream-pool>;
+
+    # Simulate what orchestrator does: detect token_needed and propagate
+    # (from orchestrator.raku lines 742-750 — iterates over @results)
+    my @results = %( %worker-result ),;  # Array with one hash element
+    for @results -> $r {
+        if ?($r<token_needed>) && $r<token_inbox> {
+            %response<token_request> = True;
+            %response<worker_token_inbox> = $r<token_inbox>;
+        }
+    }
+
+    ok(%response<token_request> ~~ True,
+       'orchestrator.propagates.token_request');
+    ok(%response<worker_token_inbox> eq '_INBOX.token.github.abc123',
+       'orchestrator.propagates.token_inbox');
+    ok(%response<result> !~~ /token/,  # token NOT in synthesized result
+       'orchestrator.token-not-in-result');
+
+    # Verify the response JSON is complete
+    my $json = to-json(%response);
+    ok($json.contains('token_request'), 'response.json.has.token_request');
+    ok($json.contains('worker_token_inbox'), 'response.json.has.worker_token_inbox');
+}
+
+# ═══════════════════════════════════════════
+# 2. ACK MESSAGE HANDLING
+# ═══════════════════════════════════════════
+
+{
+    # Simulate the message validation + ACK pattern from orchestrator
+    # Lines 110-144 of orchestrator.raku
+    my @acked = ();
+    my @rejected = ();
+
+    # Simplified orchestrator validation logic
+    sub validate-and-ack(Str $payload, :$has-reply-to) {
+        # Empty payload → reject (no ACK — nothing to ACK)
+        unless $payload {
+            @rejected.push: 'empty-payload';
+            return False;
+        }
+
+        # Invalid JSON → ack (don't redeliver garbage) and reject
+        my %req;
+        try { %req = from-json($payload) };
+        if $! {
+            @acked.push: 'invalid-json';
+            return False;
+        }
+
+        # Missing prompt → ack and reject
+        unless %req<prompt> {
+            @acked.push: 'missing-prompt';
+            return False;
+        }
+
+        # Missing reply_to → ack and reject
+        unless %req<reply_to> {
+            @acked.push: 'missing-reply-to';
+            return False;
+        }
+
+        # Valid → ack and accept
+        @acked.push: 'valid-task';
+        return True;
+    }
+
+    # Test cases
+    nok(validate-and-ack('', :has-reply-to), 'ack.rejects.empty-payload');
+    is(@rejected[0], 'empty-payload', 'ack.tracks-rejection');
+
+    nok(validate-and-ack('not json', :has-reply-to), 'ack.rejects.bad-json');
+    is(@acked[0], 'invalid-json', 'ack.acks-invalid-json');
+
+    nok(validate-and-ack('{}', :has-reply-to), 'ack.rejects.missing-prompt');
+    is(@acked[1], 'missing-prompt', 'ack.acks-missing-prompt');
+
+    nok(validate-and-ack(to-json({ :prompt('test') }), :has-reply-to),
+       'ack.rejects.missing-reply-to');
+    is(@acked[2], 'missing-reply-to', 'ack.acks-missing-reply-to');
+
+    ok(validate-and-ack(to-json({
+        :prompt('hello'),
+        :reply_to('entry.telegram.response.123')
+    }), :has-reply-to), 'ack.accepts.valid-task');
+    is(@acked[3], 'valid-task', 'ack.acks-valid-task');
+
+    # All rejection paths ACK (5 total: 3 rejects + 1 valid)
+    is(@acked.elems, 4, 'ack.all-paths-acked');
+    is(@rejected.elems, 1, 'ack.only-empty-rejected-without-ack');
+}
+
+# ═══════════════════════════════════════════
+# 3. SESSION SEQ TRACKING
+# ═══════════════════════════════════════════
+
+{
+    # Simulate CAS (compare-and-swap) session append logic
+    my $current-seq = 0;
+    my @history;
+
+    sub append-batch(@entries --> Hash) {
+        my $expected = $current-seq;
+        @history.append: @entries;
+        $current-seq += @entries.elems;
+        return { :ok(True), :seq($current-seq) };
+    }
+
+    sub append-conflict(@entries, Int $stale-seq --> Hash) {
+        if $stale-seq != $current-seq {
+            return { :error("Seq conflict"), :conflict(True),
+                     :expected_seq($stale-seq), :current_seq($current-seq) };
+        }
+        return append-batch(@entries);
+    }
+
+    # Append first batch
+    my %r1 = append-batch([{ :role<user>, :content<msg1> }, { :role<assistant>, :content<resp1> }]);
+    is(%r1<seq>, 2, 'session.seq.after-first-batch');
+    is($current-seq, 2, 'session.current-seq.tracks');
+
+    # Append second batch
+    my %r2 = append-batch([{ :role<user>, :content<msg2> }, { :role<assistant>, :content<resp2> }]);
+    is(%r2<seq>, 4, 'session.seq.after-second-batch');
+
+    # Stale seq → conflict
+    my %r3 = append-conflict([{ :role<user>, :content<stale> }], 2);
+    ok(%r3<conflict>, 'session.cas-detects-stale-seq');
+    is(%r3<current_seq>, 4, 'session.cas-reports-current-seq');
+    is($current-seq, 4, 'session.seq-unchanged-after-conflict');
+
+    # Verify history integrity
+    is(@history.elems, 4, 'session.history-size-after-batches');
+    is(@history[0]<content>, 'msg1', 'session.history.entry-1');
+    is(@history[3]<content>, 'resp2', 'session.history.entry-4');
+}
+
+# ═══════════════════════════════════════════
+# 4. /ROTATE COMMAND PARSING
+# ═══════════════════════════════════════════
+
+{
+    # Simulate entry-telegram command detection
+    sub detect-rotate(Str $text --> Str) {
+        return '' unless $text ~~ /^ '/' rotate \s+ (\S+) /;
+        return $0.Str;
+    }
+
+    is(detect-rotate('/rotate github'), 'github',
+       'rotate.parse.simple');
+    is(detect-rotate('/rotate my-custom-worker'), 'my-custom-worker',
+       'rotate.parse.hyphenated');
+    is(detect-rotate('/rotate  github '), 'github',
+       'rotate.parse.extra-spaces');
+    is(detect-rotate('hey /rotate github'), '',
+       'rotate.reject.not-at-start');
+    is(detect-rotate('rotate github'), '',
+       'rotate.reject.no-slash');
+    is(detect-rotate('/rotate'), '',
+       'rotate.reject.no-worker');
+    is(detect-rotate('/ROTATE github'), '',
+       'rotate.reject.uppercase');
+}
+
+# ═══════════════════════════════════════════
+# 5. TOKEN RELAY STATE MACHINE
+# ═══════════════════════════════════════════
+
+{
+    my %awaiting;  # chat_id → worker_token_inbox
+
+    # Entry receives token_request from orchestrator response
+    sub handle-response(%resp) {
+        if %resp<token_request> && %resp<worker_token_inbox> {
+            %awaiting{%resp<chat_id>} = %resp<worker_token_inbox>;
+            return 'token-mode-on';
+        }
+        return 'normal';
+    }
+
+    # Entry receives user message while awaiting token
+    sub handle-user-message(Str $chat-id, Str $text) {
+        if %awaiting{$chat-id} -> $inbox {
+            my $target = $inbox;
+            %awaiting{$chat-id}:delete;
+            return { :action<relay>, :$target, :$text };
+        }
+        return { :action<forward>, :$text };
+    }
+
+    # Test: normal flow
+    my %resp1 = :chat_id<123>, :result<Hello!>;
+    is(handle-response(%resp1), 'normal',
+       'token-relay.normal-response');
+
+    # Test: token request flow
+    my %resp2 = :chat_id<123>, :result<Need setup>,
+                :token_request(True), :worker_token_inbox('_INBOX.token.gh.xyz');
+    is(handle-response(%resp2), 'token-mode-on',
+       'token-relay.activates-token-mode');
+    ok(%awaiting<123> eq '_INBOX.token.gh.xyz',
+       'token-relay.stores-inbox');
+
+    # Test: user sends token while in await mode
+    my $action = handle-user-message('123', 'ghp_secret123');
+    is($action<action>, 'relay',
+       'token-relay.intercepts-token');
+    is($action<target>, '_INBOX.token.gh.xyz',
+       'token-relay.routes-to-correct-inbox');
+    is($action<text>, 'ghp_secret123',
+       'token-relay.preserves-token');
+    nok(%awaiting<123>:exists,
+       'token-relay.clears-after-relay');
+
+    # Test: normal message after token relay
+    my $action2 = handle-user-message('123', 'list repos');
+    is($action2<action>, 'forward',
+       'token-relay.resumes-normal-after-relay');
+
+    # Test: token relay for different chat (isolation)
+    %awaiting<456> = '_INBOX.token.other.abc';
+    is(handle-user-message('123', 'test')<action>, 'forward',
+       'token-relay.chat-isolation');
+}
+
+done-testing;

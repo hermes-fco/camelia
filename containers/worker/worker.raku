@@ -2,21 +2,27 @@
 # 🌺 Camélia PoC #7 — Worker Agent (JetStream pull consumer)
 #
 # Pulls tasks from JetStream WORKER_TASKS stream.
-# Self-terminates after 5 min idle.
+# Self-terminates after 15 min idle.
+# Publishes worker.status.> events for spawner lifecycle tracking.
 
 use Nats;
 use JSON::Fast;
 
 $*ERR.out-buffer = False;
 
-my $nats-url  = %*ENV<NATS_URL>  // 'nats://127.0.0.1:4222';
-my $worker-id = ('a'..'z').pick(6).join;
+my $nats-url   = %*ENV<NATS_URL>   // 'nats://127.0.0.1:4222';
+my $worker-id  = ('a'..'z').pick(6).join;
+my $worker-type = %*ENV<SERVICE_NAME> // 'worker-generic';
+$worker-type = $worker-type.subst(/^ 'worker-' /, '');
 
-note "🟡 Worker {$worker-id} connecting NATS ($nats-url)...";
+my $idle-timeout = 900;  # 15 minutes
+my $last-activity = now.Int;
+
+note "🟡 Worker {$worker-type}:{$worker-id} connecting NATS ($nats-url)...";
 my $nats = Nats.new: :servers[$nats-url];
 await $nats.start;
 $nats.connect;
-note "🟢 Worker {$worker-id} connected.";
+note "🟢 Worker {$worker-type}:{$worker-id} connected.";
 
 # ── JetStream pull consumer ──
 my $stream = Nats::Stream.new:
@@ -34,16 +40,21 @@ my $consumer = Nats::Consumer.new:
     :max-ack-pending(1),
     :ack-wait(30),
     :replay-policy<instant>,
-    :inactive-threshold(300),
+    :inactive-threshold($idle-timeout),
     ;
 note "📥 Creating durable consumer worker-{$worker-id}...";
 my $create-supply = $consumer.create-named;
 my $create-msg = await $create-supply.Promise;
 if $create-msg && $create-msg.payload && !$create-msg.payload.starts-with('-ERR') {
-    note "✅ Consumer created, pulling tasks (idle timeout=300s)...";
+    note "✅ Consumer created, pulling tasks (idle timeout={$idle-timeout}s)...";
 } else {
     note "⚠️ Consumer create: {$create-msg.?payload // 'no response'}";
 }
+
+# ── Publish startup status ──
+$nats.publish: "worker.status.{$worker-type}.{$worker-id}.started", to-json({
+    :worker_id($worker-id), :type($worker-type), :status<started>,
+});
 
 # ── Tool execution helper ──
 sub exec-tool(Str $name, $tc-id, %args --> Hash) {
@@ -86,8 +97,8 @@ Be thorough — don't leave work half-done. Return a complete result.
 END
 
 react {
-    # Pull messages from JetStream — each request waits up to 300s
-    whenever $consumer.msgs(:expires(300), :no-wait) -> $msg {
+    # ── Pull messages from JetStream ──
+    whenever $consumer.msgs(:expires($idle-timeout), :no-wait) -> $msg {
         next unless $msg.payload;
 
         # Check for JetStream errors (408 timeout, etc.)
@@ -115,12 +126,34 @@ react {
             next;
         }
 
-        note "📨 {$worker-id}: task {$task-id} — {$task-text.substr(0, 80)}...";
+        note "📨 {$worker-type}:{$worker-id}: task {$task-id} — {$task-text.substr(0, 80)}...";
+
+        # ── Publish busy status ──
+        $last-activity = now.Int;
+        $nats.publish: "worker.status.{$worker-type}.{$worker-id}.busy", to-json({
+            :worker_id($worker-id), :type($worker-type), :status<busy>, :$task-id,
+        });
 
         # ⚠️ MUST use start {} — await inside react whenever blocks the event loop,
         # preventing the model response subscription from receiving messages.
         start {
             process-task($task-id, $role, $task-text, $reply-to, $msg);
+        }
+    }
+
+    # ── Idle timer: self-terminate if inactive for too long ──
+    whenever Supply.interval(30) {
+        my $idle = now.Int - $last-activity;
+        if $idle > $idle-timeout {
+            note "⏰ {$worker-type}:{$worker-id} idle for {$idle}s > {$idle-timeout}s — self-terminating...";
+            $nats.publish: "worker.status.{$worker-type}.{$worker-id}.idle", to-json({
+                :worker_id($worker-id), :type($worker-type), :status<idle>, :reason<timeout>,
+                :idle_seconds($idle),
+            });
+            # Give NATS a moment to flush the idle message
+            sleep 0.5;
+            note "👋 {$worker-type}:{$worker-id} goodbye.";
+            exit(0);
         }
     }
 }
@@ -164,5 +197,11 @@ sub process-task($task-id, $role, $task-text, $reply-to, $msg) {
 
     $nats.publish: $reply-to, to-json({ :$worker-id, :$role, :$task-id, :result($final) });
     $consumer.ack($msg);
-    note "✅ {$worker-id}: task {$task-id} done";
+    note "✅ {$worker-type}:{$worker-id}: task {$task-id} done";
+
+    # ── Publish idle status after task completion ──
+    $last-activity = now.Int;
+    $nats.publish: "worker.status.{$worker-type}.{$worker-id}.idle", to-json({
+        :worker_id($worker-id), :type($worker-type), :status<idle>,
+    });
 }

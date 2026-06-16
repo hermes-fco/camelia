@@ -33,8 +33,8 @@ sub lifecycle(Str $event) {
         to-json({ :$worker-id, :type('{{NAME}}'), :$event, :ts(now.Real) });
 }
 # Subscribe to typed tasks
-my $task-sub = $nats.subscribe: '{{SUBJECT}}';
-note "🟢 Listening on {{SUBJECT}}";
+my $task-sub = $nats.subscribe: 'worker.{{NAME}}.task.>';
+note "🟢 Listening on worker.{{NAME}}.task.>";
 
 # Health check
 my $health-sub = $nats.subscribe: 'health.check.{{NAME}}';

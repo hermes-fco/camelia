@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY containers/spawner/spawner.raku /app/spawner.raku
+COPY spawner.raku /app/spawner.raku
 
 WORKDIR /app
 ENTRYPOINT ["raku", "/app/spawner.raku"]

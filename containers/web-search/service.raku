@@ -139,6 +139,7 @@ sub html-to-text(Str $html --> Str) {
 
 # ── Handle task ──
 my $last-activity = now;
+my $idle-timeout = 900;  # 15 minutes
 
 sub handle-task(%task, Str $reply-to, $msg) {
     my $task-str = %task<task> // '';
@@ -267,6 +268,18 @@ react {
                 :last_activity($last-activity.Real),
                 :idle_seconds((now - $last-activity).Int),
             });
+        }
+    }
+
+    # ── Idle timer: self-terminate after {$idle-timeout}s ──
+    whenever Supply.interval(30) {
+        my $idle = now.Int - $last-activity;
+        if $idle > $idle-timeout {
+            note "⏰ {$service-name}-{$worker-id} idle for {$idle}s > {$idle-timeout}s — self-terminating...";
+            lifecycle('idle');
+            sleep 0.5;
+            note "👋 {$service-name}-{$worker-id} goodbye.";
+            exit(0);
         }
     }
 }

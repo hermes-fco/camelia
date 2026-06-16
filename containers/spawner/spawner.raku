@@ -30,6 +30,11 @@ my $next-id = 1;
 my %ensure-locks;         # type → Lock
 my $lock-guard = Lock.new;  # protects %ensure-locks itself
 
+# ── Spawner-owned container tracking ──
+# Only containers created by handle-ensure-typed are eligible for idle GC.
+# docker-compose services (timer, factory, auto-pilot, etc.) are never killed.
+my %spawner-containers;   # container-id → type
+
 # ── Connect NATS ──
 note "🟡 Spawner connecting NATS ($nats-url)...";
 my $nats = Nats.new: :servers[$nats-url];
@@ -295,6 +300,7 @@ sub handle-ensure-typed(Str $type, Str $reply-to) {
         }
 
         $create-ok = True;
+        %spawner-containers{$cid} = $type;
         note "  ✅ {$container-name} ({$cid}) created+started under lock";
     }  # ── END LOCK ──
 
@@ -437,6 +443,53 @@ sub handle-reactive-gc() {
         }
     }
 
+    # ── Fallback: kill spawner-owned containers not tracked in %worker-state ──
+    # These are workers that never published worker.status.> events but were
+    # created by handle-ensure-typed. If they've been running > max-idle, kill them.
+    #
+    # Also catches PRE-FIX workers (created before %spawner-containers tracking existed):
+    # any camelia-worker-* NOT in the permanent-services set, running > 15 min → kill.
+    my $docker-scan = docker-api('GET', '/containers/json?all=true');
+    if $docker-scan ~~ Array {
+        my %permanent = set <camelia-worker-timer-1 camelia-worker-factory camelia-entry-factory-1
+                            camelia-auto-pilot-1 camelia-tool-executor-1 camelia-docker-compose-1
+                            camelia-model-deepseek-1 camelia-model-deepseek-flash-1>;
+
+        for $docker-scan.List -> $c {
+            my $cid = $c<Id> // '';
+            next unless $cid;
+
+            my @names = ($c<Names> // []).List;
+            my $container-name = @names.first({ .starts-with('/camelia-worker') || .starts-with('/camelia-model') }) // '';
+            next unless $container-name;
+            $container-name = $container-name.subst(/^ '/'/, '');
+
+            # Skip permanent services
+            next if %permanent{$container-name};
+
+            # Skip if already tracked via worker.status.> events
+            my $tracked = False;
+            for %worker-state.values -> $ws {
+                if ($ws<container-id> // '') eq $cid {
+                    $tracked = True;
+                    last;
+                }
+            }
+            next if $tracked;
+
+            # Check uptime via container creation timestamp
+            my $created = try $c<Created>.Int // 0;
+            next unless $created > 0;
+            my $uptime = $now - $created;
+            if $uptime > $max-idle {
+                note "🧹 GC Fallback: {$container-name} ({$cid}) uptime={$uptime}s > {$max-idle}s, no status events — killing...";
+                docker-api('POST', "/containers/{$cid}/stop");
+                docker-api('DELETE', "/containers/{$cid}");
+                %spawner-containers{$cid}:delete;
+            }
+        }
+    }
+
     # Prune dead containers (zombies)
     my $list = docker-api('GET', '/containers/json?all=true');
     return unless $list ~~ Array;
@@ -457,6 +510,7 @@ sub handle-reactive-gc() {
         if $state eq 'exited' | 'dead' {
             note "  🧹 GC: removing zombie {$cid} (state={$state})";
             docker-api('DELETE', "/containers/{$cid}");
+            %spawner-containers{$cid}:delete;
         }
     }
 
@@ -499,67 +553,70 @@ sub kill-worker-by-type-id(Str $type, Str $worker-id) {
 }
 
 # ═════════════════════════════════════════════
-# MAIN REACT LOOP — event-driven, NO Supply.interval
+# REACT LOOP — event-driven
 # ═════════════════════════════════════════════
 
-note "🔄 Spawner react loop ready";
+my $ctl-sub    = $nats.subscribe: 'spawner.control';
+my $ws-sub     = $nats.subscribe: 'worker.status.>';
+my $worker-sub = $nats.subscribe: 'worker.>';       # watch all worker task publications
+note "🟢 Spawner ready.";
+
+my $last-alive = now.Int;
 
 react {
-    my $control-sub = $nats.subscribe: 'spawner.control';
-    my $worker-status-sub = $nats.subscribe: 'worker.status.>';
-    my $health-sub = $nats.subscribe: 'health.check.spawner';
-    note "🟢 Listening on spawner.control, worker.status.>, health.check.spawner";
-
-    # ── Spawner control messages ──
-    whenever $control-sub.supply -> $msg {
+    # ── Control messages (spawner.control) ──
+    whenever $ctl-sub.supply -> $msg {
+        next unless $msg.payload;
         my $reply-to = $msg.?reply-to;
-        unless $reply-to {
-            note "⚠️ No reply-to, ignoring";
-            next;
-        }
+        unless $reply-to { note "⚠️ No reply-to on spawner.control"; next }
 
         my $parsed = try from-json($msg.payload);
-        if $! || !$parsed {
+        unless $parsed.defined {
             $nats.publish: $reply-to, to-json({ :error("Invalid JSON") });
             next;
         }
         my %req = $parsed;
-
         my $action = %req<action> // '';
         given $action {
             when 'ensure'       { handle-ensure(%req<count> // 0, $reply-to) }
             when 'status'       { handle-status($reply-to) }
             when 'stop_all'     { handle-stop-all($reply-to) }
             when 'ensure_typed' { handle-ensure-typed(%req<type> // '', $reply-to) }
-            default {
-                $nats.publish: $reply-to, to-json({ :error("Unknown action: $action") });
-            }
+            default { $nats.publish: $reply-to, to-json({ :error("Unknown action: $action") }) }
         }
     }
 
-    # ── REACTIVE worker lifecycle — whenever worker.status.> ──
-    whenever $worker-status-sub.supply -> $msg {
+    # ── Worker status events (worker.status.>) ──
+    whenever $ws-sub.supply -> $msg {
         next unless $msg.payload;
         handle-worker-event($msg.subject // '', $msg.payload);
     }
 
-    # ── GC: periodic zombie cleanup (still needs occasional Docker API check) ──
-    # Reduced from 60s to 120s — most GC is now event-driven via worker.status.>
-    whenever Supply.interval(120) {
-        try {
-            handle-reactive-gc();
-            CATCH { note "⚠️ GC error: {.message}" }
+    # ── Worker task monitor: watch worker.> and spawn workers on demand ──
+    # Extracts type from subject: worker.<type>.task.<id> → <type>
+    # handle-ensure-typed has per-type lock + already-running check internally.
+    # This quick check avoids the lock+Docker API call when a worker is already tracked.
+    whenever $worker-sub.supply -> $msg {
+        my $subject = $msg.subject // '';
+        next unless $subject ~~ /^ 'worker.' (.+?) '.task.' /;
+        my $type = $0.Str;
+        next if $type eq 'factory';  # factory is always running
+
+        # Check %worker-state: if any worker of this type is tracked, it's alive
+        my $has-worker = %worker-state.values.first({ .<type> eq $type && .<last-event> ne 'busy' });
+        unless $has-worker {
+            note "👀 Worker monitor: {$type} needed, spawning...";
+            handle-ensure-typed($type, '_INBOX.spawner-monitor.' ~ (^10000).pick);
         }
     }
 
-    # ── Health check ──
-    whenever $health-sub.supply -> $msg {
-        if $msg.?reply-to {
-            $nats.publish: $msg.reply-to, to-json({
-                :status<ok>, :service<spawner>,
-                :active_workers(%worker-state.elems),
-                :workers(%worker-state.values.map({ .<type> ~ ':' ~ .<id> ~ ':' ~ .<last-event> }).Array),
-            });
-        }
+    # ── Periodic GC (every 120s) ──
+    whenever Supply.interval(120) {
+        try { handle-reactive-gc(); CATCH { note "⚠️ GC error: {.message}" } }
+    }
+
+    # ── Alive heartbeat (every 300s) ──
+    whenever Supply.interval(300) {
+        note "💚 Spawner alive ({%worker-state.elems} tracked workers)";
     }
 }

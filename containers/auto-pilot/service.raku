@@ -121,6 +121,37 @@ react {
         if $checked > 0 || $resubmitted > 0 {
             note "🔍 Scan done: {$checked} checked, {$resubmitted} resubmitted";
         }
+
+        # ── Task-store: check for stale tasks ──
+        try {
+            my $ts-reply = "_INBOX.apts." ~ (('a'..'z').pick xx 8).join;
+            my $ts-sub   = $nats.subscribe: $ts-reply, :1max-messages;
+            my $tp       = $ts-sub.supply.head.Promise;
+            $nats.publish: 'task.store.list',
+                to-json({ :status<assigned> }),
+                :reply-to($ts-reply);
+            await Promise.anyof: $tp, Promise.in(5);
+            $ts-sub.unsubscribe;
+
+            if $tp.so && $tp.result.payload {
+                my $ts-parsed = try from-json($tp.result.payload);
+                if !$! && $ts-parsed && $ts-parsed<ok> {
+                    my @tasks = $ts-parsed<tasks>.List;
+                    for @tasks -> $task {
+                        my $updated = $task<updated_at> // '';
+                        # Check if task is assigned but not updated for >10 min
+                        if $updated {
+                            # Simple check: if there are assigned tasks, note them
+                            note "  📋 Stale task: {$task<id>} ({$task<description>.substr(0,50)})";
+                        }
+                    }
+                    if @tasks.elems > 0 {
+                        note "  📊 {@tasks.elems} assigned task(s) in queue";
+                    }
+                }
+            }
+            CATCH { note "  ⚠️ task-store check failed: {.message}" }
+        }
     }
 
     # ── Health check ──

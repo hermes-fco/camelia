@@ -177,7 +177,7 @@ class Nats::Consumer {
         my $subject = $.subject(CONSUMER-CREATE, $!stream, $!name);
         my %req = %(
             :stream_name($!stream),
-            :config(self.config(:!include-durable)),
+            :config(self.config),  # include durable_name for named consumer
         );
         $!nats.request: $subject, to-json %req.Map
     }
@@ -224,7 +224,8 @@ class Nats::Consumer {
             loop {
                 my $response = $!nats.request:
                     $subj,
-                    to-json(%payload.elems ?? %payload !! {});
+                    to-json(%payload.elems ?? %payload !! {}),
+                    :timeout(30);  # prevent race-condition hang (Pitfall #17)
                 # Await the response; if it's a Supply, take the first emission
                 my $msg = $response ~~ Supply
                     ?? await $response.head.Promise
